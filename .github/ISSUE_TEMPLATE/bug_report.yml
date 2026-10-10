@@ -1,0 +1,34 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Menu option or parameters used (for example `-Auto`).
+  - type: input
+    id: build
+    attributes:
+      label: Windows 10 build
+      description: Shown by `winver`, for example 19045.5000
+    validations:
+      required: true
+  - type: input
+    id: ps
+    attributes:
+      label: PowerShell version
+      description: Output of `$PSVersionTable.PSVersion`
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant log output
+      description: From `%LOCALAPPDATA%\Windows10_SystemMaintenance\Logs\`. Remove personal data first.
+      render: text

@@ -1,0 +1,11 @@
+* text=auto
+
+# PowerShell scripts keep CRLF (and their UTF-8 BOM) so Windows PowerShell 5.1 reads them correctly
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
