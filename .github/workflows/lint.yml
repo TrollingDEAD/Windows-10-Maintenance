@@ -14,15 +14,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Built script matches src/
+        shell: pwsh
+        run: ./tools/Build-Script.ps1 -Check
+
+      - name: Findings documentation is up to date
+        shell: pwsh
+        run: ./tools/New-FindingDocs.ps1 -Check
+
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          # src/ files are fragments of the built script and are analysed through it
+          $targets = @('./Windows10_SystemMaintenance.ps1', './Invoke-FleetMaintenance.ps1', './tools', './tests', './PSScriptAnalyzerSettings.psd1')
+          $results = foreach ($t in $targets) { Invoke-ScriptAnalyzer -Path $t -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 }
           $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize -Wrap
           if ($results) { exit 1 }
 
-      - name: Pester
+      - name: Pester (unit tests and dry-run smoke test)
         shell: pwsh
         run: |
           Install-Module Pester -MinimumVersion 5.0 -Force -SkipPublisherCheck -Scope CurrentUser

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TrollingDEAD/Windows-10-Maintenance/schema/report.schema.json",
+  "title": "Windows 10 System Maintenance report (JSON)",
+  "description": "Written when -ReportFormat includes Json. Stable contract for RMM tools and the fleet wrapper.",
+  "type": "object",
+  "required": ["Version", "Date", "Computer", "DryRun", "Findings", "Facts", "Actions"],
+  "properties": {
+    "Version": { "type": "string", "description": "Script version that produced the report." },
+    "Date": { "type": "string", "format": "date-time" },
+    "Computer": { "type": "string" },
+    "DryRun": { "type": "boolean" },
+    "RebootNeeded": { "type": "boolean" },
+    "RebootReasons": { "type": "array", "items": { "type": "string" } },
+    "Win11Block": { "type": "string" },
+    "Facts": { "type": "object", "additionalProperties": { "type": "string" } },
+    "Findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["Id", "Severity", "Category", "Title", "Status"],
+        "properties": {
+          "Id": { "type": "string", "description": "Stable finding ID, documented in docs/FINDINGS.md." },
+          "Severity": { "enum": ["Critical", "High", "Medium", "Low", "Info"] },
+          "Category": { "type": "string" },
+          "Title": { "type": "string" },
+          "Meaning": { "type": "string" },
+          "Evidence": { "type": "string" },
+          "Recommendation": { "type": "string" },
+          "Status": { "enum": ["Open", "Fixed", "Info"] }
+        }
+      }
+    },
+    "Tables": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "object" } } },
+    "Actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": { "Time": { "type": "string" }, "Module": { "type": "string" }, "Status": { "type": "string" }, "Details": { "type": "string" } }
+      }
+    }
+  }
+}

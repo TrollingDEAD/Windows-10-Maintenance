@@ -2,6 +2,11 @@ name: Bug report
 description: Something does not work as expected
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Please run the failing step again with `-DryRun -Redact -ReportFormat Markdown,Json` and attach the **redacted** report.
+        `-Redact` masks computer and user names, serial numbers, IP and MAC addresses. See [docs/TROUBLESHOOTING.md](../blob/main/docs/TROUBLESHOOTING.md).
   - type: textarea
     id: what
     attributes:
@@ -13,12 +18,19 @@ body:
     id: steps
     attributes:
       label: Steps to reproduce
-      description: Menu option or parameters used (for example `-Auto`).
+      description: Menu option or parameters used (for example `-Auto -Modules sys,sec`).
+  - type: input
+    id: version
+    attributes:
+      label: Script version
+      description: Shown in the menu header, for example 3.1
+    validations:
+      required: true
   - type: input
     id: build
     attributes:
       label: Windows 10 build
-      description: Shown by `winver`, for example 19045.5000
+      description: Shown by `winver`, for example 19045.5000 (and edition, e.g. Home / Pro / LTSC)
     validations:
       required: true
   - type: input
@@ -26,6 +38,17 @@ body:
     attributes:
       label: PowerShell version
       description: Output of `$PSVersionTable.PSVersion`
+  - type: input
+    id: locale
+    attributes:
+      label: Windows display language
+      description: Several tool outputs are language dependent, for example "English" or "Deutsch".
+  - type: textarea
+    id: report
+    attributes:
+      label: Redacted JSON report (relevant findings)
+      description: Paste the relevant `Findings` entries or attach the file. Do not paste unredacted reports.
+      render: json
   - type: textarea
     id: log
     attributes:

@@ -56,6 +56,49 @@
 .PARAMETER AllowOnBattery
     Long operations (DISM, SFC, updates, defrag) are normally skipped on battery power. This overrides that.
 
+.PARAMETER Quiet
+    No colours and no decorative output (plain lines), suited for log files and RMM tools. Combine with -Auto.
+
+.PARAMETER Redact
+    Masks computer name, user name, serial numbers, IP/MAC addresses and profile paths in all reports so they can be
+    posted in forums or GitHub issues.
+
+.PARAMETER Undo
+    Reverts the registry, service and policy changes recorded in the undo journal of the last run, then exits.
+
+.PARAMETER History
+    Prints the trend of the health score and the number of open findings from the stored snapshots, then exits.
+
+.PARAMETER ConfigPath
+    JSON file with preferences: SuppressFindings (finding IDs to hide), NeverCleanPaths, NeverTouchServices,
+    EsuEndDate, WebhookUrl. Default: %LOCALAPPDATA%\Windows10_SystemMaintenance\config.json (created on request).
+
+.PARAMETER WebhookUrl
+    HTTPS URL (Teams, Slack, ntfy, Discord, ...) that receives a short JSON summary, but only when the set of open
+    findings changed since the previous run.
+
+.PARAMETER Toast
+    Shows a Windows notification with the result at the end of the run.
+
+.PARAMETER CheckUpdate
+    Asks the GitHub Releases API whether a newer version exists and verifies the published SHA256 before offering the
+    download. Never updates by itself.
+
+.PARAMETER UninstallKB
+    Uninstalls one update by its KB number (for example KB5034441) via wusa, then exits.
+
+.PARAMETER ScheduleDay
+    Day of the week for -Schedule (default Sunday).
+
+.PARAMETER ScheduleTime
+    Time of day (HH:mm) for -Schedule (default 03:00).
+
+.PARAMETER Gui
+    Opens a small window to pick modules and options (dry run, HTML report), then starts the normal run with them.
+
+.PARAMETER ExportApps
+    Writes the list of installed winget packages to a JSON file next to the report (for reinstalling after a reset).
+
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -File .\Windows10_SystemMaintenance.ps1
 
@@ -81,11 +124,27 @@ param(
     [int]$LogRetentionDays = 60,
     [switch]$Schedule,
     [switch]$Unschedule,
-    [switch]$AllowOnBattery
+    [switch]$AllowOnBattery,
+    [switch]$Quiet,
+    [switch]$Redact,
+    [switch]$Undo,
+    [switch]$History,
+    [string]$ConfigPath,
+    [string]$WebhookUrl,
+    [switch]$Toast,
+    [switch]$CheckUpdate,
+    [string]$UninstallKB,
+    [ValidateSet('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')]
+    [string]$ScheduleDay = 'Sunday',
+    [ValidatePattern('^\d{1,2}:\d{2}$')]
+    [string]$ScheduleTime = '03:00',
+    [switch]$ExportApps,
+    [switch]$Gui
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '3.0'
+$script:Version = '3.1'
+$script:RepoUrl = 'https://github.com/TrollingDEAD/Windows-10-Maintenance'
 $script:TaskName = 'Windows10_SystemMaintenance_Weekly'
 
 # ----------------------------------------------------------------------------------------------
@@ -138,12 +197,20 @@ if ($Schedule -or $Unschedule) {
     if (-not $PSCommandPath) { Write-Host 'Scheduling needs the script to be run from a file.' -ForegroundColor Red; exit 1 }
     $taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Auto -NoElevate"
     $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
+    foreach ($fwd in 'ReportFormat', 'WebhookUrl', 'ConfigPath', 'Redact', 'Quiet', 'Toast') {
+        if ($PSBoundParameters.ContainsKey($fwd)) {
+            $v = $PSBoundParameters[$fwd]
+            if ($v -is [switch]) { if ($v.IsPresent) { $taskArgs += " -$fwd" } } else { $taskArgs += " -$fwd `"$(@($v) -join ',')`"" }
+        }
+    }
+    $at = [datetime]::ParseExact($ScheduleTime.PadLeft(5, '0'), 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $ScheduleDay -At $at
     $action = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) -MultipleInstances IgnoreNew
+    # Only when idle, wake the PC for the run, and give up after 4 hours
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun -RunOnlyIfIdle -IdleDuration (New-TimeSpan -Minutes 5) -IdleWaitTimeout (New-TimeSpan -Hours 2) -ExecutionTimeLimit (New-TimeSpan -Hours 4) -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName $script:TaskName -Trigger $trigger -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Host "Scheduled task '$($script:TaskName)' registered: Sundays 03:00 as SYSTEM (-Auto). Reports go to %ProgramData%\Windows10_SystemMaintenance\Reports." -ForegroundColor Green
+    Write-Host "Scheduled task '$($script:TaskName)' registered: $ScheduleDay $ScheduleTime as SYSTEM (-Auto, runs when idle). Reports go to %ProgramData%\Windows10_SystemMaintenance\Reports." -ForegroundColor Green
     exit 0
 }
 
@@ -159,7 +226,7 @@ if (-not $script:HasMutex) {
 # Normalise array parameters (the elevated relaunch passes them as "a,b").
 $script:ModuleList = @($Modules | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
 $script:ReportFormats = @($ReportFormat | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$validModules = 'sys', 'net', 'disk', 'sec', 'evt', 'svc', 'audit', 'clean', 'integ', 'wu', 'store', 'opt', 'w11'
+$validModules = 'sys', 'net', 'disk', 'sec', 'evt', 'svc', 'audit', 'rec', 'clean', 'integ', 'wu', 'store', 'opt', 'w11'
 $badModules = @($script:ModuleList | Where-Object { $_ -notin $validModules })
 if ($badModules.Count -gt 0) { Write-Host "Unknown module(s): $($badModules -join ', '). Valid: $($validModules -join ', ')" -ForegroundColor Red; exit 1 }
 $badFormats = @($script:ReportFormats | Where-Object { $_ -notin 'Markdown', 'Html', 'Json' })
@@ -170,6 +237,12 @@ $script:DryRun = [bool]$DryRun
 $script:AllowOnBattery = [bool]$AllowOnBattery
 $script:IsSystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
 $script:ExitCode = 0
+$script:Quiet = [bool]$Quiet
+$script:Redact = [bool]$Redact
+$script:Config = @{}
+$script:Journal = New-Object System.Collections.Generic.List[object]
+$script:Suppressed = New-Object System.Collections.Generic.List[string]
+$script:JournalPath = $null
 $script:StartedAt = Get-Date
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:Actions = New-Object System.Collections.Generic.List[object]
@@ -192,17 +265,20 @@ $script:ReportBase = Join-Path $script:ReportDir ("Windows10_SystemReport_{0}" -
 $script:ReportPath = "$($script:ReportBase).md"
 $script:LogDir = Join-Path $dataRoot 'Logs'
 $script:SnapshotDir = Join-Path $dataRoot 'Snapshots'
+$script:JournalDir = Join-Path $dataRoot 'Journal'
+$script:ConfigFile = if ($ConfigPath) { $ConfigPath } else { Join-Path $dataRoot 'config.json' }
 $script:LogPath = Join-Path $script:LogDir ("SystemMaintenance_{0}.log" -f $stamp)
 try {
     New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
     New-Item -ItemType Directory -Path $script:SnapshotDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $script:JournalDir -Force | Out-Null
     Start-Transcript -Path $script:LogPath -Force | Out-Null
     $script:TranscriptOn = $true
 } catch { $script:TranscriptOn = $false }
 
 # Log/snapshot retention (reports on the desktop are the user's and are not touched).
 if ($LogRetentionDays -gt 0) {
-    foreach ($d in $script:LogDir, $script:SnapshotDir) {
+    foreach ($d in $script:LogDir, $script:SnapshotDir, $script:JournalDir) {
         Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$LogRetentionDays) } |
             Remove-Item -Force -ErrorAction SilentlyContinue
@@ -221,16 +297,21 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 # ----------------------------------------------------------------------------------------------
 # 1. Helper functions: output, input, findings
 # ----------------------------------------------------------------------------------------------
+function Out-Line([string]$Text, [string]$Color = 'Gray') {
+    # Single exit point for console text: -Quiet prints plain lines without colour.
+    if ($script:Quiet) { Write-Host $Text } else { Write-Host $Text -ForegroundColor $Color }
+}
 function Write-Title([string]$Text) {
+    if ($script:Quiet) { Write-Host "== $Text =="; return }
     Write-Host ''
     Write-Host ('=' * 74) -ForegroundColor DarkCyan
     Write-Host ("  $Text") -ForegroundColor Cyan
     Write-Host ('=' * 74) -ForegroundColor DarkCyan
 }
-function Write-Info([string]$m) { Write-Host "  [i]  $m" -ForegroundColor Gray }
-function Write-Ok([string]$m)   { Write-Host "  [OK] $m" -ForegroundColor Green }
-function Write-Warn2([string]$m){ Write-Host "  [!]  $m" -ForegroundColor Yellow }
-function Write-Bad([string]$m)  { Write-Host "  [X]  $m" -ForegroundColor Red }
+function Write-Info([string]$m) { Out-Line "  [i]  $m" 'Gray' }
+function Write-Ok([string]$m)   { Out-Line "  [OK] $m" 'Green' }
+function Write-Warn2([string]$m){ Out-Line "  [!]  $m" 'Yellow' }
+function Write-Bad([string]$m)  { Out-Line "  [X]  $m" 'Red' }
 
 function Confirm-Step {
     # Yes/no prompt. -Risky: in Auto mode it is NOT executed.
@@ -310,6 +391,13 @@ function Add-Finding {
         [string]$Recommendation = '',
         [ValidateSet('Open','Fixed','Info')][string]$Status = 'Open'
     )
+    # User-accepted findings (config SuppressFindings, wildcards allowed) are counted but not reported
+    foreach ($pat in @($script:Config.SuppressFindings)) {
+        if ($pat -and $Id -like $pat) {
+            if (-not $script:Suppressed.Contains($Id)) { $script:Suppressed.Add($Id) }
+            return
+        }
+    }
     $old = $script:Findings | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
     if ($old) { [void]$script:Findings.Remove($old) }
     $script:Findings.Add([pscustomobject]@{
@@ -318,7 +406,7 @@ function Add-Finding {
     })
     $color = switch ($Severity) { 'Critical' { 'Red' } 'High' { 'Red' } 'Medium' { 'Yellow' } 'Low' { 'DarkYellow' } default { 'Gray' } }
     $tag = if ($Status -eq 'Fixed') { 'FIXED' } else { $Severity.ToUpper() }
-    Write-Host ("  [{0}] {1}" -f $tag, $Title) -ForegroundColor $color
+    Out-Line ("  [{0}] {1}" -f $tag, $Title) $color
 }
 
 function Set-FindingFixed {
@@ -334,6 +422,82 @@ function Set-FindingFixed {
 function Request-Reboot([string]$Reason) {
     $script:RebootNeeded = $true
     if (-not $script:RebootReasons.Contains($Reason)) { $script:RebootReasons.Add($Reason) }
+}
+
+# ---- Undo journal: every reversible change is recorded with its previous value ----------------
+function Save-Journal {
+    if ($script:DryRun -or $script:Journal.Count -eq 0 -or -not $script:JournalPath) { return }
+    try {
+        $obj = [ordered]@{ Version = $script:Version; Date = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME; Entries = $script:Journal.ToArray() }
+        [IO.File]::WriteAllText($script:JournalPath, ($obj | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
+    } catch {}
+}
+
+function Add-JournalEntry {
+    param([string]$Type, [string]$Target, $Old, $New, [string]$Note = '')
+    if ($script:DryRun) { return }
+    if (-not $script:JournalPath) { $script:JournalPath = Join-Path $script:JournalDir ("journal_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss')) }
+    $script:Journal.Add([pscustomobject]@{ Time = (Get-Date).ToString('o'); Type = $Type; Target = $Target; Old = $Old; New = $New; Note = $Note })
+    Save-Journal
+}
+
+function Set-RegistryValueTracked {
+    param([string]$Path, [string]$Name, $Value, [ValidateSet('String', 'DWord')][string]$Type = 'DWord')
+    $existed = $false; $old = $null
+    try { $old = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name; $existed = $true } catch {}
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+    Set-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
+    Add-JournalEntry -Type 'Registry' -Target "$Path|$Name|$Type" -Old $(if ($existed) { "$old" } else { $null }) -New "$Value" -Note $(if ($existed) { 'value changed' } else { 'value created' })
+}
+
+function Set-ServiceStartTracked {
+    param([string]$Name, [string]$StartupType)
+    $before = (Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue).StartMode
+    Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
+    Add-JournalEntry -Type 'Service' -Target $Name -Old $before -New $StartupType
+}
+
+function Invoke-Undo {
+    $files = @(Get-ChildItem -LiteralPath $script:JournalDir -Filter 'journal_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($files.Count -eq 0) { Write-Warn2 'No undo journal found - nothing to revert.'; return }
+    $f = $files[0]
+    $j = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    $entries = @($j.Entries)
+    Write-Info "Undo journal $($f.Name) from $($j.Date): $($entries.Count) change(s)."
+    if (-not (Confirm-Step "Revert these $($entries.Count) change(s) now?" -Default $false -ReadOnly)) { Write-Info 'Nothing reverted.'; return }
+    [array]::Reverse($entries)
+    $okN = 0; $failN = 0; $notReversible = $false
+    foreach ($e in $entries) {
+        try {
+            switch ($e.Type) {
+                'Registry' {
+                    $p, $n, $t = $e.Target -split '\|'
+                    if ($null -eq $e.Old) { Remove-ItemProperty -LiteralPath $p -Name $n -ErrorAction Stop }
+                    else {
+                        $val = if ($t -eq 'DWord') { [int]$e.Old } else { [string]$e.Old }
+                        Set-ItemProperty -LiteralPath $p -Name $n -Value $val -Type $t -Force -ErrorAction Stop
+                    }
+                }
+                'Service'   { if ($e.Old) { Set-Service -Name $e.Target -StartupType ($(if ($e.Old -eq 'Auto') { 'Automatic' } else { $e.Old })) -ErrorAction Stop } }
+                'PowerPlan' { Invoke-Native -File "$env:WINDIR\System32\powercfg.exe" -Arguments @('/setactive', [string]$e.Old) -Quiet | Out-Null }
+                'Feature'   { Enable-WindowsOptionalFeature -Online -FeatureName $e.Target -NoRestart -ErrorAction Stop | Out-Null }
+                'Account'   { Enable-LocalUser -Name $e.Target -ErrorAction Stop }
+                'Firewall'  { Set-NetFirewallProfile -Name $e.Target -Enabled False -ErrorAction Stop }
+                'Smb1'      { Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force -ErrorAction Stop }
+                'StartupApproved' {
+                    $p, $n = $e.Target -split '\|'
+                    if ($null -eq $e.Old) { Remove-ItemProperty -LiteralPath $p -Name $n -ErrorAction Stop }
+                    else { Set-ItemProperty -LiteralPath $p -Name $n -Value ([byte[]]($e.Old -split '-' | ForEach-Object { [Convert]::ToByte($_, 16) })) -Type Binary -Force -ErrorAction Stop }
+                }
+                'Pagefile'  { Set-CimInstance -InputObject (Get-CimInstance Win32_ComputerSystem) -Property @{ AutomaticManagedPagefile = $false } -ErrorAction Stop }
+                default     { $notReversible = $true }
+            }
+            if ($notReversible) { Write-Info "Skipped (not reversible): $($e.Type) $($e.Target) $($e.Note)"; $notReversible = $false; continue }
+            Write-Ok "Reverted: $($e.Type) $($e.Target)"; $okN++
+        } catch { Write-Warn2 "Could not revert $($e.Type) $($e.Target): $($_.Exception.Message)"; $failN++ }
+    }
+    Add-Action 'Undo' $(if ($failN -eq 0) { 'Success' } else { 'Partial' }) "$okN reverted, $failN failed (journal $($f.Name))."
+    Write-Info "Undo finished: $okN reverted, $failN failed. A restart may be needed for features and policies."
 }
 
 function Invoke-Module {
@@ -366,16 +530,22 @@ function Invoke-Native {
         # Time-limited run: output goes through a temp file; the process is killed when the limit is exceeded.
         $tmp = Join-Path $env:TEMP ("w10m_{0}.txt" -f [guid]::NewGuid().ToString('N'))
         $argStr = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
-        $timedOut = $false; $code = -1
+        $timedOut = $false; $code = -1; $errText = ''
         try {
-            $p = Start-Process -FilePath $File -ArgumentList $argStr -NoNewWindow -PassThru -RedirectStandardOutput $tmp -ErrorAction Stop
+            $p = Start-Process -FilePath $File -ArgumentList $argStr -NoNewWindow -PassThru -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err" -ErrorAction Stop
             if (-not $p.WaitForExit($TimeoutSec * 1000)) { $timedOut = $true; try { $p.Kill() } catch {} } else { $code = $p.ExitCode }
         } catch { $code = -1 }
+        if (Test-Path -LiteralPath "$tmp.err") {
+            # stderr is appended to the output so error messages of the tool are not lost
+            try { $errText = [string](Get-Content -LiteralPath "$tmp.err" -Raw -ErrorAction SilentlyContinue) } catch {}
+            Remove-Item -LiteralPath "$tmp.err" -Force -ErrorAction SilentlyContinue
+        }
         if (Test-Path -LiteralPath $tmp) {
             $bytes = [IO.File]::ReadAllBytes($tmp)
             # sfc.exe writes UTF-16, most other tools write the OEM/ANSI code page.
             $isUtf16 = ($bytes.Length -gt 1 -and ($bytes | Select-Object -First 200 | Where-Object { $_ -eq 0 }).Count -gt 10)
-            $text = if ($isUtf16) { [Text.Encoding]::Unicode.GetString($bytes) } else { [Text.Encoding]::Default.GetString($bytes) }
+            $text = if ($isUtf16) { [Text.Encoding]::Unicode.GetString($bytes) } else { [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($bytes) }   # console tools write the OEM code page
+            if ($errText) { $text += "`n$errText" }
             foreach ($raw in ($text -split "`r?`n")) {
                 $l = (([string]$raw) -replace "`0", '').Trim()
                 if ($l) { $lines.Add($l); if (-not $Quiet) { Write-Host "       $l" -ForegroundColor DarkGray } }
@@ -433,6 +603,9 @@ function Clear-Folder {
     param([string]$Path, [int]$OlderThanDays = 0, [string]$NameLike = '*')
     $res = [pscustomobject]@{ Freed = [int64]0; Files = 0; Failed = 0 }
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) { return $res }
+    foreach ($never in @($script:Config.NeverCleanPaths)) {
+        if ($never -and $Path -like "$never*") { Write-Info "Skipped (NeverCleanPaths): $Path"; return $res }
+    }
     $cutoff = (Get-Date).AddDays(-$OlderThanDays)
     $dirs = New-Object System.Collections.Generic.List[string]
     foreach ($f in (Get-FilesSafe -Path $Path -DirList $dirs)) {
@@ -655,6 +828,170 @@ $script:EventIgnore = @('Microsoft-Windows-DistributedCOM|10016')
 # ----------------------------------------------------------------------------------------------
 # 3. Preparation: operating system, internet, restore point
 # ----------------------------------------------------------------------------------------------
+# ---- Configuration, health score, redaction, history, notifications, self-update -------------
+function Import-ScriptConfig {
+    $script:Config = @{ SuppressFindings = @(); NeverCleanPaths = @(); NeverTouchServices = @(); WingetPin = @(); EsuEndDate = '2026-10-13'; WebhookUrl = '' }
+    if (Test-Path -LiteralPath $script:ConfigFile) {
+        try {
+            $c = Get-Content -LiteralPath $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($p in $c.PSObject.Properties) { if ($p.Name -notmatch '^_') { $script:Config[$p.Name] = $p.Value } }
+            Write-Info "Configuration loaded: $script:ConfigFile"
+        } catch { Write-Warn2 "Configuration file is not valid JSON and was ignored: $($_.Exception.Message)" }
+    }
+}
+
+function New-ScriptConfig {
+    # Writes a commented starter config the first time it is requested (never overwrites).
+    if (Test-Path -LiteralPath $script:ConfigFile) { return }
+    $starter = [ordered]@{
+        '_help'            = 'SuppressFindings: finding IDs (wildcards ok, e.g. "evt-*") you accept and do not want in the report. NeverCleanPaths: folders the cleanup must skip. NeverTouchServices: service names the script must not reset. WingetPin: winget package IDs that must not be upgraded. EsuEndDate: end of your Windows 10 ESU coverage. WebhookUrl: optional https notification endpoint.'
+        'SuppressFindings' = @()
+        'NeverCleanPaths'  = @()
+        'NeverTouchServices' = @()
+        'WingetPin'        = @()
+        'EsuEndDate'       = '2026-10-13'
+        'WebhookUrl'       = ''
+    }
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $script:ConfigFile -Parent) -Force | Out-Null
+        [IO.File]::WriteAllText($script:ConfigFile, ($starter | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($true)))
+        Write-Info "A starter configuration was written to $script:ConfigFile"
+    } catch {}
+}
+
+function Get-HealthScore {
+    # 100 minus weighted open findings; returns Score (0-100) and a label.
+    $weights = @{ 'Critical' = 25; 'High' = 12; 'Medium' = 5; 'Low' = 2; 'Info' = 0 }
+    $penalty = 0
+    foreach ($f in @($script:Findings | Where-Object { $_.Status -eq 'Open' })) { $penalty += $weights[$f.Severity] }
+    $score = [math]::Max(0, 100 - $penalty)
+    $label = if ($score -ge 90) { 'Excellent' } elseif ($score -ge 75) { 'Good' } elseif ($score -ge 50) { 'Needs attention' } else { 'Poor' }
+    return [pscustomobject]@{ Score = $score; Label = $label }
+}
+
+function Protect-ReportText([string]$Text) {
+    # -Redact: mask identifying details so a report can be posted publicly.
+    if (-not $script:Redact -or [string]::IsNullOrEmpty($Text)) { return $Text }
+    $names = @($env:COMPUTERNAME, $env:USERNAME, $env:USERDOMAIN)
+    try { $names += (Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber } catch {}
+    try { $names += (Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID } catch {}
+    try { $names += (Get-CimInstance Win32_BaseBoard -ErrorAction Stop).SerialNumber } catch {}
+    foreach ($n in ($names | Where-Object { $_ -and $_.Length -ge 3 -and $_ -notmatch '^(To be filled|Default string|None|System Serial|0+)' } | Select-Object -Unique)) {
+        $Text = $Text -replace [regex]::Escape($n), '[redacted]'
+    }
+    $Text = $Text -replace '\b(?!127\.|0\.)(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}\b', 'x.x.x.x'
+    $Text = $Text -replace '\b([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b', 'xx:xx:xx:xx:xx:xx'
+    return $Text
+}
+
+function Show-History {
+    $snaps = @(Get-ChildItem -LiteralPath $script:SnapshotDir -Filter 'snapshot_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    if ($snaps.Count -eq 0) { Write-Warn2 'No snapshots yet - run the script at least once.'; return }
+    $rows = foreach ($s in $snaps) {
+        try {
+            $j = Get-Content -LiteralPath $s.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $open = @($j.Findings | Where-Object { $_.Status -eq 'Open' })
+            [pscustomobject]@{
+                Date = ([datetime]$j.Date).ToString('yyyy-MM-dd HH:mm'); Score = $j.Score
+                Open = $open.Count; Critical = @($open | Where-Object Severity -eq 'Critical').Count; High = @($open | Where-Object Severity -eq 'High').Count
+                Bar = ('#' * [math]::Round([double]$j.Score / 5))
+            }
+        } catch {}
+    }
+    Write-Info "Health history (newest last, $(@($rows).Count) run(s)):"
+    @($rows) | Format-Table Date, Score, Open, Critical, High, Bar -AutoSize | Out-String -Width 200 | Write-Host
+    $first = @($rows)[0]; $last = @($rows)[-1]
+    if ($first -and $last -and $null -ne $first.Score -and $null -ne $last.Score) {
+        $d = [int]$last.Score - [int]$first.Score
+        Write-Info ("Trend since the first run: {0}{1} points." -f $(if ($d -ge 0) { '+' } else { '' }), $d)
+    }
+}
+
+function Send-RunNotification {
+    $hs = Get-HealthScore
+    $open = @($script:Findings | Where-Object { $_.Status -eq 'Open' })
+    $changed = (-not $script:Diff) -or (-not $script:Diff.HasPrev) -or (@($script:Diff.New).Count + @($script:Diff.Resolved).Count -gt 0)
+    $name = if ($script:Redact) { '[redacted]' } else { $env:COMPUTERNAME }
+    $summary = "${name}: health $($hs.Score)/100 ($($hs.Label)), $($open.Count) open, $(@($script:Findings | Where-Object { $_.Status -eq 'Fixed' }).Count) fixed."
+    if ($script:Diff -and $script:Diff.HasPrev) { $summary += " New: $(@($script:Diff.New).Count), resolved: $(@($script:Diff.Resolved).Count)." }
+
+    $url = if ($WebhookUrl) { $WebhookUrl } else { [string]$script:Config.WebhookUrl }
+    if ($url -and $changed) {
+        if ($url -notmatch '^https://') { Write-Warn2 'Webhook ignored: only https:// URLs are allowed.' }
+        else {
+            try {
+                if ($url -match 'ntfy') { Invoke-RestMethod -Uri $url -Method Post -Body $summary -ContentType 'text/plain' -TimeoutSec 20 | Out-Null }
+                else {
+                    $body = @{ text = $summary; content = $summary; computer = $name; score = $hs.Score; open = $open.Count } | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 20 | Out-Null
+                }
+                Write-Ok 'Notification sent to the webhook.'
+                Add-Action 'Notification' 'Success' 'Webhook called.'
+            } catch { Write-Warn2 "Webhook failed: $($_.Exception.Message)" }
+        }
+    } elseif ($url) { Write-Info 'Webhook not called: nothing changed since the previous run.' }
+
+    if ($Toast) {
+        try {
+            $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+            $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+            $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+            $xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>Windows 10 maintenance finished</text><text>$([Security.SecurityElement]::Escape($summary))</text></binding></visual></toast>")
+            $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+        } catch { Write-Info "Toast notification not available: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-UpdateCheck {
+    # Opt-in: asks GitHub for the latest release and verifies its SHA256. Never replaces the running script.
+    if (-not $script:Online) { Write-Warn2 'No internet connection - update check skipped.'; return }
+    try {
+        $api = ($script:RepoUrl -replace 'https://github.com/', 'https://api.github.com/repos/') + '/releases/latest'
+        $rel = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'Windows10-SystemMaintenance'; 'Accept' = 'application/vnd.github+json' } -TimeoutSec 20
+        $latest = ($rel.tag_name -replace '^v', '')
+        Write-Info "Installed version: $script:Version, latest release: $latest"
+        $isNewer = $false
+        try { $isNewer = ([version]$latest -gt [version]$script:Version) } catch { $isNewer = ($latest -ne $script:Version) }
+        if (-not $isNewer) { Write-Ok 'You are up to date.'; return }
+        $asset = @($rel.assets | Where-Object { $_.name -eq 'Windows10_SystemMaintenance.ps1' }) | Select-Object -First 1
+        $sums = @($rel.assets | Where-Object { $_.name -match 'SHA256' }) | Select-Object -First 1
+        Write-Info "A newer version is available: $($rel.html_url)"
+        Add-Finding -Id 'script-update' -Severity 'Info' -Category 'Script' -Title "Version $latest of this script is available" `
+            -Meaning 'A newer release exists on GitHub. The script never updates itself.' -Recommendation "Review the release notes at $($rel.html_url)" -Status 'Info'
+        if ($asset -and $sums -and (Confirm-Step 'Download the new version to your Downloads folder and verify its checksum?' -Default $false -Risky)) {
+            $dir = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
+            $target = Join-Path $dir "Windows10_SystemMaintenance_$latest.ps1"
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $target -UseBasicParsing -TimeoutSec 60
+            $sumText = (Invoke-WebRequest -Uri $sums.browser_download_url -UseBasicParsing -TimeoutSec 20).Content
+            $want = [regex]::Match([string]$sumText, "(?im)^\s*([0-9a-f]{64})\s+\*?Windows10_SystemMaintenance\.ps1").Groups[1].Value
+            $have = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+            if ($want -and $have -ieq $want) { Write-Ok "Downloaded and verified: $target (SHA256 $have). Review it, then replace your copy."; Add-Action 'Update check' 'Downloaded' $target }
+            else { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue; Write-Bad 'Checksum mismatch - the download was deleted.'; Add-Action 'Update check' 'Checksum mismatch' 'Download deleted.' }
+        }
+    } catch { Write-Warn2 "Update check failed: $($_.Exception.Message)" }
+}
+
+function Invoke-KbUninstall([string]$Kb) {
+    $id = ($Kb -replace '(?i)^KB', '')
+    if ($id -notmatch '^\d{6,8}$') { Write-Bad "'$Kb' is not a valid KB number."; return }
+    if (-not (Get-HotFix -Id "KB$id" -ErrorAction SilentlyContinue)) { Write-Warn2 "KB$id is not installed."; return }
+    if (-not (Confirm-Step "Uninstall KB$id now? (Security updates should normally stay installed.)" -Default $false -Risky)) { return }
+    if (Test-DryRun "uninstall KB$id") { return }
+    $r = Invoke-Native -File "$env:WINDIR\System32\wusa.exe" -Arguments @('/uninstall', "/kb:$id", '/quiet', '/norestart') -Quiet -TimeoutSec 1800
+    Write-Info "wusa exit code $($r.ExitCode) (3010 = restart required, 2359302 = not installed)."
+    if ($r.ExitCode -in 0, 3010) { Request-Reboot "KB$id uninstalled"; Add-Action 'KB uninstall' 'Success' "KB$id" } else { Add-Action 'KB uninstall' 'Failed' "KB$id exit $($r.ExitCode)" }
+}
+
+function Export-InstalledApp {
+    $w = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $w) { Write-Warn2 'winget is not installed - app export skipped.'; return }
+    $out = Join-Path $script:ReportDir ("Windows10_Apps_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $r = Invoke-Native -File $w.Source -Arguments @('export', '-o', $out, '--accept-source-agreements', '--disable-interactivity') -Quiet -TimeoutSec 300
+    if (Test-Path -LiteralPath $out) { Write-Ok "Installed apps exported: $out (restore with 'winget import -i <file>')."; Add-Action 'App export' 'Success' $out }
+    else { Write-Warn2 "winget export produced no file (exit code $($r.ExitCode))." }
+}
+
 function Initialize-Preflight {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
@@ -687,6 +1024,7 @@ function Initialize-Preflight {
 
     # Support status
     $esuEnd = Get-Date '2026-10-13'
+    try { if ($script:Config.EsuEndDate) { $esuEnd = [datetime]::Parse([string]$script:Config.EsuEndDate, [Globalization.CultureInfo]::InvariantCulture) } } catch {}
     $today = Get-Date
     $daysEsu = [math]::Ceiling(($esuEnd.Date - $today.Date).TotalDays)
     if ($daysEsu -ge 0) {
@@ -924,6 +1262,48 @@ function Invoke-SystemDiagnostics {
         if ($cyc -and $cyc.CycleCount -gt 0) { Add-Fact 'Battery charge cycles' $cyc.CycleCount }
     } catch {}
 
+    # Sampled load: who uses CPU and disk right now? (locale-independent WMI performance classes)
+    try {
+        Write-Info 'Sampling CPU and disk activity for 5 seconds ...'
+        $cores = [math]::Max(1, [int]$cs.NumberOfLogicalProcessors)
+        $diskS = @(); $procMax = @{}
+        for ($i = 0; $i -lt 5; $i++) {
+            $pp = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop | Where-Object { $_.Name -notin '_Total', 'Idle' })
+            foreach ($p in $pp) {
+                if (-not $procMax.ContainsKey($p.Name)) { $procMax[$p.Name] = [pscustomobject]@{ Name = $p.Name; Cpu = 0.0; Io = 0.0 } }
+                $procMax[$p.Name].Cpu += [double]$p.PercentProcessorTime / $cores / 5
+                $procMax[$p.Name].Io += [double]$p.IODataBytesPersec / 5
+            }
+            $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction SilentlyContinue
+            if ($d) { $diskS += [double]$d.PercentDiskTime }
+            Start-Sleep -Seconds 1
+        }
+        $diskAvg = if ($diskS.Count) { [math]::Round(($diskS | Measure-Object -Average).Average, 0) } else { $null }
+        if ($null -ne $diskAvg) { Add-Fact 'Disk activity (5 s average)' "$([math]::Min(100, $diskAvg)) %" }
+        $topCpu = @($procMax.Values | Sort-Object Cpu -Descending | Select-Object -First 5)
+        $script:Tables['Busiest processes (5 second sample)'] = @($topCpu | ForEach-Object { [pscustomobject]@{ Process = $_.Name; 'CPU %' = [math]::Round($_.Cpu, 1); 'Disk I/O' = "$(Format-Size $_.Io)/s" } })
+        if ($null -ne $diskAvg -and $diskAvg -ge 90) {
+            $topIo = ($procMax.Values | Sort-Object Io -Descending | Select-Object -First 1).Name
+            Add-Finding -Id 'disk-busy' -Severity 'Medium' -Category 'Performance' -Title "The system drive is busy ($([math]::Min(100, $diskAvg)) % active)" `
+                -Meaning 'A constantly busy drive makes the whole PC feel slow. Typical culprits: indexing, antivirus scans, updates, an almost full or failing disk (especially an HDD).' `
+                -Evidence "Most disk traffic: $topIo" -Recommendation 'Wait for background work to finish, check disk health in this report, and consider an SSD if this is a hard disk.'
+        }
+    } catch {}
+
+    # Edition quirks and Office Click-to-Run
+    try {
+        $ed = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).EditionID
+        if ($ed -match 'EnterpriseS|IoT|LTSC') { Add-Fact 'Servicing channel' "$ed (long-term servicing: no Store/feature updates by design)" }
+    } catch {}
+    $c2r = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    if ($c2r -and $c2r.VersionToReport) {
+        Add-Fact 'Office (Click-to-Run)' "$($c2r.VersionToReport), channel: $(($c2r.CDNBaseUrl -split '/')[-1]), updates enabled: $($c2r.UpdatesEnabled)"
+        if ("$($c2r.UpdatesEnabled)" -eq 'False') {
+            Add-Finding -Id 'office-updates-off' -Severity 'Medium' -Category 'Software' -Title 'Microsoft Office updates are turned off' `
+                -Meaning 'Office is a prime target for attackers; without updates known holes stay open.' -Recommendation 'Any Office app > File > Account > Update Options > Enable Updates.'
+        }
+    }
+
     # Temporary profile
     if ($env:USERPROFILE -match '\\TEMP(\.|$)') {
         Add-Finding -Id 'temp-profile' -Severity 'High' -Category 'System' -Title 'You are signed in with a temporary profile' `
@@ -1135,7 +1515,7 @@ function Invoke-SecurityHardening {
                 -Meaning 'Even if the SMB1 server is off, the installed feature keeps the outdated and exploitable SMB1 client/server components on the PC.' `
                 -Recommendation "Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol (restart required). Old NAS devices may stop working."
             if (Confirm-Step 'Remove the SMB1 Windows feature now? (Very old NAS/printers may stop working.)' -Risky) {
-                try { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null; Set-FindingFixed -Id 'smb1-feature' -WhatWasDone 'The SMB1 feature was removed (effective after a restart). Undo: Enable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol'; Request-Reboot 'SMB1 feature removal'; Add-Action 'SMB1 feature' 'Fixed' 'Removed.' } catch { Write-Warn2 $_.Exception.Message }
+                try { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null; Add-JournalEntry -Type 'Feature' -Target 'SMB1Protocol' -Old 'Enabled' -New 'Disabled'; Set-FindingFixed -Id 'smb1-feature' -WhatWasDone 'The SMB1 feature was removed (effective after a restart). Undo: Enable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol'; Request-Reboot 'SMB1 feature removal'; Add-Action 'SMB1 feature' 'Fixed' 'Removed.' } catch { Write-Warn2 $_.Exception.Message }
             }
         }
     } catch {}
@@ -1146,7 +1526,7 @@ function Invoke-SecurityHardening {
                 -Meaning 'PowerShell 2.0 has no modern logging or AMSI protection; attackers use it to bypass defences ("downgrade attack").' `
                 -Recommendation 'Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root (restart not needed for most systems).'
             if (Confirm-Step 'Remove PowerShell 2.0 now (recommended, nothing modern needs it)?' -Risky) {
-                try { Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart -ErrorAction Stop | Out-Null; Set-FindingFixed -Id 'psv2' -WhatWasDone 'PowerShell 2.0 was removed.'; Add-Action 'PowerShell 2.0' 'Fixed' 'Removed.' } catch { Write-Warn2 $_.Exception.Message }
+                try { Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart -ErrorAction Stop | Out-Null; Add-JournalEntry -Type 'Feature' -Target 'MicrosoftWindowsPowerShellV2Root' -Old 'Enabled' -New 'Disabled'; Set-FindingFixed -Id 'psv2' -WhatWasDone 'PowerShell 2.0 was removed.'; Add-Action 'PowerShell 2.0' 'Fixed' 'Removed.' } catch { Write-Warn2 $_.Exception.Message }
             }
         }
     } catch {}
@@ -1174,7 +1554,7 @@ function Invoke-SecurityHardening {
             -Recommendation "Set HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest\UseLogonCredential to 0 (or delete it) and check the PC for malware."
         if (Confirm-Step 'Set WDigest UseLogonCredential back to 0 now (safe)?') {
             if (-not (Test-DryRun 'set WDigest UseLogonCredential=0')) {
-                try { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name UseLogonCredential -Value 0 -Type DWord -ErrorAction Stop; Set-FindingFixed -Id 'wdigest' -WhatWasDone 'UseLogonCredential was set to 0.'; Add-Action 'WDigest' 'Fixed' 'UseLogonCredential=0' } catch { Write-Warn2 $_.Exception.Message }
+                try { Set-RegistryValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name UseLogonCredential -Value 0 -Type DWord; Set-FindingFixed -Id 'wdigest' -WhatWasDone 'UseLogonCredential was set to 0.'; Add-Action 'WDigest' 'Fixed' 'UseLogonCredential=0' } catch { Write-Warn2 $_.Exception.Message }
             }
         }
     }
@@ -1253,7 +1633,7 @@ function Invoke-SecurityAudit {
                 -Meaning 'The Guest account allows sign-in without a personal account and is rarely needed.' `
                 -Recommendation "net user Guest /active:no (admin prompt)."
             if (Confirm-Step 'Disable the Guest account now?' -Risky) {
-                if (-not (Test-DryRun 'disable Guest account')) { try { Disable-LocalUser -Name $guest.Name -ErrorAction Stop; Set-FindingFixed -Id 'guest-enabled' -WhatWasDone 'The Guest account was disabled.' } catch { Write-Warn2 $_.Exception.Message } }
+                if (-not (Test-DryRun 'disable Guest account')) { try { Disable-LocalUser -Name $guest.Name -ErrorAction Stop; Add-JournalEntry -Type 'Account' -Target $guest.Name -Old 'Enabled' -New 'Disabled'; Set-FindingFixed -Id 'guest-enabled' -WhatWasDone 'The Guest account was disabled.' } catch { Write-Warn2 $_.Exception.Message } }
             }
         }
         $builtIn = $users | Where-Object { $_.SID.Value -match '-500$' -and $_.Enabled }
@@ -1322,6 +1702,16 @@ function Invoke-SecurityAudit {
         }
         $script:Tables['Third-party scheduled tasks'] = @($trows | Select-Object -First 60)
         Add-Fact 'Third-party scheduled tasks' "$($tasks.Count)"
+        $orphans = @()
+        foreach ($t in $tasks) {
+            $exe = [Environment]::ExpandEnvironmentVariables([string](@($t.Actions)[0].Execute)).Trim('"')
+            if ($exe -and $exe -match '^[A-Za-z]:\\' -and -not (Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue)) { $orphans += "$($t.TaskPath)$($t.TaskName) -> $exe" }
+        }
+        if ($orphans.Count -gt 0) {
+            Add-Finding -Id 'tasks-orphaned' -Severity 'Low' -Category 'Persistence' -Title "$($orphans.Count) scheduled task(s) point to programs that no longer exist" `
+                -Meaning 'Leftovers of uninstalled software. They fail silently at every trigger and clutter the system; malware cleanup also often leaves them.' `
+                -Evidence (($orphans | Select-Object -First 8) -join "`n") -Recommendation 'Task Scheduler: delete these tasks.'
+        }
         if ($sus.Count -gt 0) {
             Add-Finding -Id 'tasks-suspicious' -Severity 'Medium' -Category 'Persistence' -Title "$($sus.Count) scheduled task(s) look unusual" `
                 -Meaning 'These tasks run from user-writable folders or use script/encoded-command tricks. Legitimate software does this sometimes, malware does it almost always.' `
@@ -1375,6 +1765,12 @@ function Invoke-SecurityAudit {
                 -Evidence (($unq | Select-Object -First 8 | ForEach-Object { "$($_.Name): $($_.PathName)" }) -join "`n") `
                 -Recommendation 'Reinstall/update the software; or put the full path to the service in quotes under HKLM\SYSTEM\CurrentControlSet\Services\<name>\ImagePath.'
         }
+        $orphSvc = @($svcs | Where-Object { $_.PathName -match '^\s*"?([A-Za-z]:\\[^"]+?\.(exe|sys))' -and -not (Test-Path -LiteralPath ([Environment]::ExpandEnvironmentVariables($Matches[1]))) })
+        if ($orphSvc.Count -gt 0) {
+            Add-Finding -Id 'svc-orphaned' -Severity 'Low' -Category 'Persistence' -Title "$($orphSvc.Count) service(s) point to files that no longer exist" `
+                -Meaning 'Remnants of removed software (or of malware that was cleaned up). Harmless but they log errors at every boot.' `
+                -Evidence (($orphSvc | Select-Object -First 8 | ForEach-Object { "$($_.Name): $($_.PathName)" }) -join "`n") -Recommendation "Admin prompt: sc delete <name> (after confirming the software is gone)."
+        }
         $usr = @($svcs | Where-Object { $_.PathName -match '(?i)\\Users\\|\\Temp\\|\\AppData\\' })
         if ($usr.Count -gt 0) {
             Add-Finding -Id 'svc-userpath' -Severity 'Medium' -Category 'Persistence' -Title "$($usr.Count) service(s) run programs from user-writable folders" `
@@ -1419,7 +1815,135 @@ function Invoke-SecurityAudit {
         }
     } catch {}
 
-    Add-Action 'Security audit' 'Completed' ("Accounts, ports, persistence, services, proxy, software in {0:N0} s." -f ((Get-Date) - $startAt).TotalSeconds)
+    # --- Network shares open to Everyone ---
+    try {
+        $open = @()
+        foreach ($sh in (Get-SmbShare -ErrorAction Stop | Where-Object { -not $_.Special })) {
+            $acc = @(Get-SmbShareAccess -Name $sh.Name -ErrorAction SilentlyContinue | Where-Object { $_.AccountName -match 'Everyone|Jeder|ANONYMOUS' -and "$($_.AccessControlType)" -eq 'Allow' })
+            if ($acc.Count -gt 0) { $open += "$($sh.Name) -> $($sh.Path) ($(($acc | ForEach-Object { $_.AccessRight }) -join '/'))" }
+        }
+        if ($open.Count -gt 0) {
+            Add-Finding -Id 'shares-everyone' -Severity 'Medium' -Category 'Network' -Title "$($open.Count) network share(s) are open to Everyone" `
+                -Meaning 'Anyone who can reach this PC on the network can read (or change) the shared folder.' -Evidence ($open -join "`n") `
+                -Recommendation 'Share only with named users (folder > Properties > Sharing > Advanced Sharing > Permissions) or remove the share.'
+        }
+    } catch {}
+
+    # --- Firewall: inbound allow rules without program and port restriction ---
+    try {
+        $wide = @()
+        foreach ($r in (Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { [string]::IsNullOrEmpty($_.DisplayGroup) })) {
+            $app = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+            $port = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+            $addr = $r | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+            if ($app.Program -eq 'Any' -and $port.LocalPort -eq 'Any' -and $addr.RemoteAddress -eq 'Any' -and $port.Protocol -in 'Any', '6', '17') { $wide += $r.DisplayName }
+        }
+        if ($wide.Count -gt 0) {
+            Add-Finding -Id 'firewall-wide-open' -Severity 'Medium' -Category 'Security' -Title "$($wide.Count) custom firewall rule(s) allow all inbound traffic" `
+                -Meaning 'A rule with no program, no port and no address restriction switches the firewall off for everything it covers.' `
+                -Evidence (($wide | Select-Object -First 8) -join "`n") -Recommendation 'Windows Defender Firewall with Advanced Security > Inbound Rules: delete or restrict these rules.'
+        }
+    } catch {}
+
+    # --- Remote Desktop hardening (only if RDP is on) ---
+    if ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections') -eq 0) {
+        $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+        if ((Get-RegValue $rdpTcp 'UserAuthentication') -eq 0) {
+            Add-Finding -Id 'rdp-no-nla' -Severity 'High' -Category 'Security' -Title 'Remote Desktop does not require Network Level Authentication' `
+                -Meaning 'Without NLA the login screen is exposed before authentication, which enables brute force and several known RDP exploits.' `
+                -Recommendation 'Settings > System > Remote Desktop > Advanced settings: require Network Level Authentication.'
+        }
+    }
+
+    # --- Local password and lockout policy ---
+    try {
+        $inf = Join-Path $env:TEMP ("w10m_sec_{0}.inf" -f [guid]::NewGuid().ToString('N'))
+        $null = Invoke-Native -File "$env:WINDIR\System32\secedit.exe" -Arguments @('/export', '/cfg', $inf, '/areas', 'SECURITYPOLICY') -Quiet -TimeoutSec 60
+        if (Test-Path -LiteralPath $inf) {
+            $pol = Get-Content -LiteralPath $inf -Raw
+            Remove-Item -LiteralPath $inf -Force -ErrorAction SilentlyContinue
+            $minLen = [regex]::Match($pol, '(?m)^MinimumPasswordLength\s*=\s*(\d+)').Groups[1].Value
+            $lock = [regex]::Match($pol, '(?m)^LockoutBadCount\s*=\s*(\d+)').Groups[1].Value
+            if ($minLen -ne '' -or $lock -ne '') { Add-Fact 'Password policy' "min. length $minLen, lockout after $(if ($lock -eq '0') { 'never' } else { "$lock failed attempts" })" }
+            if ($lock -eq '0') {
+                Add-Finding -Id 'no-lockout' -Severity 'Low' -Category 'Accounts' -Title 'Accounts are never locked after failed sign-ins' `
+                    -Meaning 'Without an account lockout threshold, passwords can be guessed indefinitely (relevant if RDP or file sharing is reachable).' `
+                    -Recommendation "Local Security Policy > Account Policies > Account Lockout Policy: threshold 10, duration 15 minutes."
+            }
+        }
+    } catch {}
+
+    # --- Exploit protection (DEP / ASLR) ---
+    try {
+        $mit = Get-ProcessMitigation -System -ErrorAction Stop
+        Add-Fact 'Exploit protection (system)' "DEP: $($mit.DEP.Enable), ASLR bottom-up: $($mit.ASLR.BottomUp)"
+        if ("$($mit.DEP.Enable)" -eq 'OFF') {
+            Add-Finding -Id 'dep-off' -Severity 'High' -Category 'Security' -Title 'Data Execution Prevention (DEP) is off system-wide' `
+                -Meaning 'DEP blocks code from running in data memory, a basic defence against many exploits.' -Recommendation "Windows Security > App & browser control > Exploit protection settings > DEP: Use default (On)."
+        }
+    } catch {}
+
+    # --- VPN left connected, Device Guard ---
+    try {
+        $vpn = @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue | Where-Object { "$($_.ConnectionStatus)" -eq 'Connected' })
+        if ($vpn.Count -gt 0) { Add-Fact 'VPN connected' (($vpn | ForEach-Object { $_.Name }) -join ', ') }
+    } catch {}
+    try {
+        $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop
+        Add-Fact 'Virtualization-based security' $(if (@($dg.SecurityServicesRunning).Count -gt 0) { "running (services: $(@($dg.SecurityServicesRunning) -join ','))" } else { 'not running' })
+    } catch {}
+
+    # --- Expired / expiring machine certificates ---
+    try {
+        $certs = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop | Where-Object { $_.NotAfter -lt (Get-Date).AddDays(30) })
+        if ($certs.Count -gt 0) {
+            Add-Finding -Id 'certs-expiring' -Severity 'Low' -Category 'Security' -Title "$($certs.Count) computer certificate(s) expired or expire within 30 days" `
+                -Meaning 'Expired certificates break VPN, Wi-Fi 802.1X, RDP or internal web access.' `
+                -Evidence (($certs | Select-Object -First 6 | ForEach-Object { "$($_.Subject) (expires $($_.NotAfter.ToString('yyyy-MM-dd')))" }) -join "`n") -Recommendation 'Renew or remove the certificates you no longer use (certlm.msc).'
+        }
+    } catch {}
+
+    # --- Stale local accounts ---
+    try {
+        $stale = @(Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled -and $_.LastLogon -and $_.LastLogon -lt (Get-Date).AddDays(-180) -and $_.SID.Value -notmatch '-50[0-3]$' })
+        if ($stale.Count -gt 0) {
+            Add-Finding -Id 'stale-accounts' -Severity 'Low' -Category 'Accounts' -Title "$($stale.Count) enabled account(s) not used for 6+ months" `
+                -Meaning 'Forgotten accounts are easy targets because nobody notices misuse.' -Evidence (($stale | ForEach-Object { "$($_.Name) (last sign-in $($_.LastLogon.ToString('yyyy-MM-dd')))" }) -join "`n") `
+                -Recommendation 'Disable or delete accounts you no longer need (Settings > Accounts > Family & other users).'
+        }
+    } catch {}
+
+    # --- Browsers: age of the installed build, and extensions ---
+    try {
+        $browsers = @(
+            @{ N = 'Google Chrome'; P = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"; P2 = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"; Ext = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Extensions" },
+            @{ N = 'Microsoft Edge'; P = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"; P2 = "${env:ProgramFiles}\Microsoft\Edge\Application\msedge.exe"; Ext = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Extensions" },
+            @{ N = 'Mozilla Firefox'; P = "${env:ProgramFiles}\Mozilla Firefox\firefox.exe"; P2 = "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"; Ext = $null })
+        $extRows = @()
+        foreach ($b in $browsers) {
+            $exe = @($b.P, $b.P2) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+            if (-not $exe) { continue }
+            $item = Get-Item -LiteralPath $exe
+            $ageD = [int]((Get-Date) - $item.LastWriteTime).TotalDays
+            Add-Fact "Browser: $($b.N)" "$($item.VersionInfo.ProductVersion), file date $($item.LastWriteTime.ToString('yyyy-MM-dd'))"
+            if ($ageD -gt 120) {
+                Add-Finding -Id "browser-old-$($b.N -replace '\W', '')" -Severity 'Medium' -Category 'Software' -Title "$($b.N) has not been updated for $ageD days" `
+                    -Meaning 'Browsers are patched every few weeks; an old build has known, publicly exploitable holes.' -Recommendation 'Open the browser > About, let it update, and restart it (or run the winget upgrade step).'
+            }
+            if ($b.Ext -and (Test-Path -LiteralPath $b.Ext)) {
+                foreach ($d in (Get-ChildItem -LiteralPath $b.Ext -Directory -ErrorAction SilentlyContinue)) {
+                    $ver = Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+                    $man = if ($ver) { Join-Path $ver.FullName 'manifest.json' } else { $null }
+                    $nm = ''; $vv = ''
+                    if ($man -and (Test-Path -LiteralPath $man)) { try { $mj = Get-Content -LiteralPath $man -Raw -Encoding UTF8 | ConvertFrom-Json; $nm = [string]$mj.name; $vv = [string]$mj.version } catch {} }
+                    $extRows += [pscustomobject]@{ Browser = $b.N; Extension = $(if ($nm -match '^__MSG') { "$($d.Name) (localized name)" } elseif ($nm) { $nm } else { $d.Name }); Version = $vv }
+                }
+            }
+        }
+        if ($extRows.Count -gt 0) { $script:Tables['Browser extensions (default profile)'] = @($extRows | Select-Object -First 60) }
+    } catch {}
+
+    Add-Action 'Security audit' 'Completed' ("Accounts, ports, persistence, services, proxy, shares, firewall, RDP, policy, browsers, software in {0:N0} s." -f ((Get-Date) - $startAt).TotalSeconds)
 }
 
 function Invoke-SecurityDiagnostics {
@@ -1480,7 +2004,7 @@ function Invoke-SecurityDiagnostics {
                 -Meaning 'The firewall blocks unwanted connections from outside. Without it, services on your PC are directly reachable on the network.' `
                 -Recommendation 'Windows Security > Firewall & network protection > turn on the profile.'
             if (Confirm-Step "Turn firewall profile '$($p.Name)' back on now (recommended, unless another firewall is in use)?" -Risky) {
-                try { Set-NetFirewallProfile -Name $p.Name -Enabled True -ErrorAction Stop; Set-FindingFixed -Id $fid -WhatWasDone "The script turned on Windows Firewall in the '$($p.Name)' profile."; Add-Action 'Firewall' 'Fixed' "Profile $($p.Name) turned on." } catch { Write-Warn2 $_.Exception.Message }
+                try { Set-NetFirewallProfile -Name $p.Name -Enabled True -ErrorAction Stop; Add-JournalEntry -Type 'Firewall' -Target $p.Name -Old 'False' -New 'True'; Set-FindingFixed -Id $fid -WhatWasDone "The script turned on Windows Firewall in the '$($p.Name)' profile."; Add-Action 'Firewall' 'Fixed' "Profile $($p.Name) turned on." } catch { Write-Warn2 $_.Exception.Message }
             }
         }
     } catch {}
@@ -1501,7 +2025,7 @@ function Invoke-SecurityDiagnostics {
                 -Meaning 'SMB1 is a file-sharing protocol over 30 years old with serious security holes (the basis of WannaCry, among others). Only very old devices (old NAS, printers) still need it.' `
                 -Recommendation "Turn it off unless an old device depends on it: PowerShell (admin) 'Set-SmbServerConfiguration -EnableSMB1Protocol `$false'."
             if (Confirm-Step 'Turn off SMB1 now? (Older network devices may no longer be reachable afterwards.)' -Default $true -Risky) {
-                try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop; Set-FindingFixed -Id 'smb1' -WhatWasDone 'SMB1 was turned off. To undo: Set-SmbServerConfiguration -EnableSMB1Protocol $true'; Add-Action 'SMB1' 'Fixed' 'SMB1 server disabled.' } catch { Write-Warn2 $_.Exception.Message }
+                try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop; Add-JournalEntry -Type 'Smb1' -Target 'SMB1 server' -Old 'True' -New 'False'; Set-FindingFixed -Id 'smb1' -WhatWasDone 'SMB1 was turned off. To undo: Set-SmbServerConfiguration -EnableSMB1Protocol $true'; Add-Action 'SMB1' 'Fixed' 'SMB1 server disabled.' } catch { Write-Warn2 $_.Exception.Message }
             }
         }
     } catch {}
@@ -1696,6 +2220,109 @@ function Invoke-StabilityCheck {
         $lk = Get-FolderBytes "$env:WINDIR\LiveKernelReports"
         if ($lk -gt 1GB) { Add-Fact 'LiveKernelReports size' (Format-Size $lk) }
     } catch {}
+
+    # Boot time and the slowest startup items (Diagnostics-Performance log, events 100/101)
+    try {
+        $perf = 'Microsoft-Windows-Diagnostics-Performance/Operational'
+        $boots = @(Get-WinEvent -FilterHashtable @{ LogName = $perf; Id = 100; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 10 -ErrorAction Stop)
+        $times = foreach ($b in $boots) {
+            $x = [xml]$b.ToXml()
+            $bt = ($x.Event.EventData.Data | Where-Object { $_.Name -eq 'BootTime' }).'#text'
+            if ($bt) { [math]::Round([double]$bt / 1000, 0) }
+        }
+        if (@($times).Count -gt 0) {
+            $avg = [math]::Round((@($times) | Measure-Object -Average).Average, 0)
+            Add-Fact 'Boot time (last boots)' "average $avg s, latest $(@($times)[0]) s, from $(@($times).Count) boot(s)"
+            if ($avg -gt 120) {
+                Add-Finding -Id 'boot-slow' -Severity 'Low' -Category 'Performance' -Title "Windows takes about $avg seconds to start" `
+                    -Meaning 'A start longer than two minutes usually means too many startup programs, a slow or full drive, or a driver that delays the boot.' `
+                    -Recommendation 'See the list of slow startup items in this report, reduce autostart programs and check disk health.'
+            }
+        }
+        $slow = @(Get-WinEvent -FilterHashtable @{ LogName = $perf; Id = 101; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 200 -ErrorAction Stop)
+        $rows = foreach ($s in $slow) {
+            $x = [xml]$s.ToXml(); $d = $x.Event.EventData.Data
+            [pscustomobject]@{ Program = ($d | Where-Object Name -eq 'FriendlyName').'#text'; Seconds = [math]::Round([double]($d | Where-Object Name -eq 'TotalTime').'#text' / 1000, 1) }
+        }
+        $top = @($rows | Where-Object { $_.Program } | Group-Object Program | ForEach-Object { [pscustomobject]@{ 'Startup program' = $_.Name; 'Slowed boot (times)' = $_.Count; 'Average delay (s)' = [math]::Round(($_.Group | Measure-Object Seconds -Average).Average, 1) } } |
+            Sort-Object 'Average delay (s)' -Descending | Select-Object -First 8)
+        if ($top.Count -gt 0) { $script:Tables['Slowest startup programs (last 30 days)'] = $top }
+        $sd = @(Get-WinEvent -FilterHashtable @{ LogName = $perf; Id = 203; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 20 -ErrorAction Stop)
+        if ($sd.Count -ge 3) {
+            Add-Finding -Id 'shutdown-slow' -Severity 'Low' -Category 'Performance' -Title "$($sd.Count) slow shutdowns in 30 days" `
+                -Meaning 'Windows had to wait for an app or service to close during shutdown.' -Recommendation 'Update or uninstall the programs named in Event Viewer > Applications and Services Logs > Microsoft > Windows > Diagnostics-Performance (event 203).'
+        }
+    } catch {}
+
+    # Event logs: disabled or recently cleared logs hide problems (and are an attacker trick)
+    try {
+        foreach ($l in (Get-WinEvent -ListLog 'System', 'Application', 'Microsoft-Windows-Windows Defender/Operational' -ErrorAction SilentlyContinue)) {
+            if (-not $l.IsEnabled) {
+                Add-Finding -Id "evtlog-off-$($l.LogName)" -Severity 'Medium' -Category 'Event log' -Title "The event log '$($l.LogName)' is disabled" `
+                    -Meaning 'Without it Windows and the script cannot see errors or Defender detections.' -Recommendation 'Enable the log in Event Viewer (right-click > Enable Log).'
+            }
+        }
+        $cleared = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 104; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 5 -ErrorAction SilentlyContinue)
+        if ($cleared.Count -gt 0) {
+            Add-Finding -Id 'evtlog-cleared' -Severity 'Medium' -Category 'Event log' -Title 'An event log was cleared in the last 30 days' `
+                -Meaning 'Clearing logs removes evidence. You may have done it with a "cleaner" tool; if not, it is a typical step after a compromise.' `
+                -Evidence (($cleared | ForEach-Object { $_.TimeCreated.ToString('yyyy-MM-dd HH:mm') }) -join '; ') -Recommendation 'If you did not do this, run a full offline Defender scan and change important passwords.'
+        }
+    } catch {}
+}
+
+function Invoke-RecoveryCheck {
+    # Can the PC be recovered? WinRE, restore points, backups, BitLocker keys, boot configuration.
+    try {
+        $re = (Invoke-Native -File "$env:WINDIR\System32\reagentc.exe" -Arguments @('/info') -Quiet -TimeoutSec 60).Output
+        if ($re -match '(?i)Windows RE status\s*:\s*Disabled|Windows RE-Status\s*:\s*(Deaktiviert|Disabled)') {
+            Add-Finding -Id 'winre-off' -Severity 'Medium' -Category 'Recovery' -Title 'The Windows Recovery Environment (WinRE) is disabled' `
+                -Meaning 'WinRE provides "Reset this PC", Startup Repair and System Restore from the boot menu. Without it a PC that no longer boots is much harder to rescue.' `
+                -Evidence $re -Recommendation "Admin prompt: 'reagentc /enable'. If that fails, the recovery partition is missing or too small."
+            if (Confirm-Step 'Try to enable WinRE now (reagentc /enable)?') {
+                $r = Invoke-Native -File "$env:WINDIR\System32\reagentc.exe" -Arguments @('/enable') -Quiet -TimeoutSec 120
+                if ($r.ExitCode -eq 0) { Set-FindingFixed -Id 'winre-off' -WhatWasDone 'WinRE was enabled with reagentc /enable.'; Add-Action 'WinRE' 'Fixed' 'reagentc /enable' }
+                else { Write-Warn2 "reagentc /enable failed (exit $($r.ExitCode))." }
+            }
+        } elseif ($re -match '(?i)Enabled|Aktiviert') { Add-Fact 'Windows Recovery Environment' 'enabled' }
+    } catch {}
+
+    $rp = $null
+    try { $rp = Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object CreationTime -Descending | Select-Object -First 1 } catch {}
+    $rpAge = $null
+    if ($rp) { try { $rpAge = ((Get-Date) - [Management.ManagementDateTimeConverter]::ToDateTime($rp.CreationTime)).Days } catch {} }
+    if ($null -ne $rpAge) { Add-Fact 'Newest restore point' "$rpAge day(s) old" }
+
+    $fh = $null
+    try { $fh = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-FileHistory-Core/WHC'; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 1 -ErrorAction Stop } catch {}
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    $oneDriveKfm = $docs -match 'OneDrive'
+    Add-Fact 'File History (30 days)' $(if ($fh) { 'active' } else { 'no activity' })
+    Add-Fact 'Documents folder in OneDrive' $(if ($oneDriveKfm) { 'yes' } else { 'no' })
+    if (-not $fh -and -not $oneDriveKfm -and ($null -eq $rpAge -or $rpAge -gt 30)) {
+        Add-Finding -Id 'no-backup' -Severity 'Medium' -Category 'Recovery' -Title 'No Windows backup mechanism is in use' `
+            -Meaning 'Neither File History, OneDrive folder backup nor a recent restore point was found. If the drive fails or ransomware hits, personal files are lost. (Third-party backup tools are not detected by this check.)' `
+            -Recommendation 'Turn on File History (Settings > Update & Security > Backup) or OneDrive "Back up" for Desktop/Documents/Pictures, and keep one copy offline.'
+    }
+
+    try {
+        foreach ($v in @(Get-BitLockerVolume -ErrorAction Stop | Where-Object { "$($_.ProtectionStatus)" -eq 'On' })) {
+            if (-not @($v.KeyProtector | Where-Object { "$($_.KeyProtectorType)" -eq 'RecoveryPassword' })) {
+                Add-Finding -Id "bitlocker-nokey-$($v.MountPoint)" -Severity 'Medium' -Category 'Recovery' -Title "BitLocker on $($v.MountPoint) has no recovery password" `
+                    -Meaning 'If the TPM or hardware changes you can be locked out of your own data.' -Recommendation "manage-bde -protectors -add $($v.MountPoint) -RecoveryPassword, then store the key outside this PC."
+            } else { Add-Fact "BitLocker recovery key ($($v.MountPoint))" 'a recovery password exists - make sure you stored it outside this PC' }
+        }
+    } catch {}
+
+    try {
+        $bcd = Invoke-Native -File "$env:WINDIR\System32\bcdedit.exe" -Arguments @('/enum') -Quiet -TimeoutSec 30
+        if ($bcd.ExitCode -ne 0) {
+            Add-Finding -Id 'bcd-error' -Severity 'High' -Category 'Recovery' -Title 'The boot configuration (BCD) cannot be read' `
+                -Meaning 'The boot configuration store is damaged or inaccessible. The PC may fail to boot after the next restart.' `
+                -Evidence $bcd.Output -Recommendation 'Boot from Windows installation media > Repair your computer > Command Prompt: bootrec /rebuildbcd. The script never does this automatically.'
+        }
+    } catch {}
+    Add-Action 'Recovery check' 'Completed' 'WinRE, restore points, File History/OneDrive, BitLocker keys, BCD.'
 }
 
 function Invoke-EventLogAnalysis {
@@ -1824,8 +2451,9 @@ function Invoke-ServiceAndDriverCheck {
             $label = "$($nice[$name]) ($name)"
             Write-Warn2 "Service disabled: $label"
             if (Test-DryRun "reset $label to $($expected[$name])") { $failedSvc += "$label (DryRun: not changed)"; continue }
+            if ($script:Config.NeverTouchServices -and $name -in @($script:Config.NeverTouchServices)) { Write-Info "Service $name is on your NeverTouchServices list - left disabled."; continue }
             try {
-                Set-Service -Name $name -StartupType $expected[$name] -ErrorAction Stop
+                Set-ServiceStartTracked -Name $name -StartupType $expected[$name]
                 if ($expected[$name] -eq 'Automatic') { Start-Service -Name $name -ErrorAction SilentlyContinue }
                 $fixedSvc += $label
             } catch { $failedSvc += "$label ($($_.Exception.Message))" }
@@ -2104,12 +2732,18 @@ function Invoke-Cleanup {
             -Recommendation 'Run "wsl --shutdown", then "Optimize-VHD -Path <file> -Mode Full" (Hyper-V module) or diskpart > select vdisk file=... > compact vdisk.' -Status 'Info'
     }
 
+    Invoke-DriverStoreReview
+
     # Component store cleanup
     if ((Test-LongOperationAllowed 'Component store cleanup') -and (Confirm-Step 'Clean up the Windows component store (DISM StartComponentCleanup, safe, may take a few minutes)?')) {
         Write-Info 'Cleaning up the component store ...'
         $r = Invoke-Native -File "$env:WINDIR\System32\dism.exe" -Arguments @('/Online', '/Cleanup-Image', '/StartComponentCleanup') -Quiet -TimeoutSec 3600
         if ($r.ExitCode -eq 0) { Write-Ok 'Component store cleaned up.'; Add-Action 'Cleanup' 'Success' 'DISM StartComponentCleanup completed.' }
         else { Write-Warn2 "DISM reported code $($r.ExitCode)."; Add-Action 'Cleanup' 'Note' "DISM StartComponentCleanup: return code $($r.ExitCode)" }
+        if ($r.ExitCode -eq 0 -and (Confirm-Step 'ALSO remove all superseded component versions (DISM /ResetBase)? Frees the most space, but installed updates can then no longer be uninstalled.' -Default $false -Risky)) {
+            $r2 = Invoke-Native -File "$env:WINDIR\System32\dism.exe" -Arguments @('/Online', '/Cleanup-Image', '/StartComponentCleanup', '/ResetBase') -Quiet -TimeoutSec 3600
+            Add-Action 'Cleanup' $(if ($r2.ExitCode -eq 0) { 'Success' } else { 'Note' }) "DISM /ResetBase: return code $($r2.ExitCode)"
+        }
     }
 
     $freeAfter = Get-SystemFreeBytes
@@ -2371,6 +3005,24 @@ function Invoke-IntegrityChecks {
             Add-Action 'Store repair' 'Success' 'wsreset executed.'
         }
     }
+    $stuck = @(Get-ChildItem "$env:WINDIR\System32\spool\PRINTERS" -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) })
+    if ($stuck.Count -gt 0) {
+        Add-Finding -Id 'print-stuck' -Severity 'Low' -Category 'System' -Title "$($stuck.Count) print job file(s) are stuck in the spooler queue" `
+            -Meaning 'Old queue files block printing ("printer offline" / jobs that never finish).' -Recommendation 'Stop the Print Spooler, delete the queue files, start it again (the script can do this).'
+        if (Confirm-Step 'Clear the stuck print queue (stops and restarts the Print Spooler)?' -Default $false -Risky) {
+            Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
+            $stuck | Remove-Item -Force -ErrorAction SilentlyContinue
+            Start-Service -Name Spooler -ErrorAction SilentlyContinue
+            Set-FindingFixed -Id 'print-stuck' -WhatWasDone 'The spooler queue was cleared and the service restarted.'
+            Add-Action 'Printer repair' 'Success' "$($stuck.Count) stuck file(s) removed."
+        }
+    }
+    if (Confirm-Step 'Rebuild the Windows Search index (fixes missing results / high indexer load; takes a while in the background)?' -Default $false -Risky) {
+        Stop-Service -Name WSearch -Force -ErrorAction SilentlyContinue
+        Set-RegistryValueTracked -Path 'HKLM:\SOFTWARE\Microsoft\Windows Search' -Name 'SetupCompletedSuccessfully' -Value 0 -Type DWord
+        Start-Service -Name WSearch -ErrorAction SilentlyContinue
+        Add-Action 'Search repair' 'Success' 'Index rebuild triggered.'
+    }
     if (Confirm-Step 'Rebuild the Explorer icon cache (fixes wrong/blank icons; Explorer restarts briefly)?' -Default $false -Risky) {
         Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
         Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Windows\Explorer" -Filter 'iconcache_*.db' -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -2397,13 +3049,12 @@ function Set-Win11Block {
         if (-not (Test-Path $pol)) { New-Item -Path $pol -Force | Out-Null }
         $cur = Get-ItemProperty $pol -ErrorAction SilentlyContinue
         $prev = "TargetReleaseVersion=$($cur.TargetReleaseVersion); ProductVersion=$($cur.ProductVersion); TargetReleaseVersionInfo=$($cur.TargetReleaseVersionInfo)"
-        Set-ItemProperty -Path $pol -Name TargetReleaseVersion -Value 1 -Type DWord -Force
-        Set-ItemProperty -Path $pol -Name ProductVersion -Value 'Windows 10' -Type String -Force
-        Set-ItemProperty -Path $pol -Name TargetReleaseVersionInfo -Value '22H2' -Type String -Force
-        Set-ItemProperty -Path $pol -Name DisableOSUpgrade -Value 1 -Type DWord -Force
+        Set-RegistryValueTracked -Path $pol -Name TargetReleaseVersion -Value 1 -Type DWord
+        Set-RegistryValueTracked -Path $pol -Name ProductVersion -Value 'Windows 10' -Type String
+        Set-RegistryValueTracked -Path $pol -Name TargetReleaseVersionInfo -Value '22H2' -Type String
+        Set-RegistryValueTracked -Path $pol -Name DisableOSUpgrade -Value 1 -Type DWord
         $os2 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\OSUpgrade'
-        if (-not (Test-Path $os2)) { New-Item -Path $os2 -Force | Out-Null }
-        Set-ItemProperty -Path $os2 -Name AllowOSUpgrade -Value 0 -Type DWord -Force
+        Set-RegistryValueTracked -Path $os2 -Name AllowOSUpgrade -Value 0 -Type DWord
         $script:Win11BlockState = 'ACTIVE (policy target version = Windows 10 22H2 set)'
         Write-Ok 'Windows 11 block active: target version = Windows 10 22H2.'
         Add-Action 'Windows 11 block' 'Active' "Policy set. Previous state: $prev"
@@ -2444,7 +3095,7 @@ function Repair-UpdateServices {
     foreach ($n in 'wuauserv', 'BITS', 'CryptSvc', 'UsoSvc') {
         $s = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
         if ($s -and $s.StartMode -eq 'Disabled' -and -not (Test-DryRun "set update service $n from Disabled to Manual")) {
-            try { Set-Service -Name $n -StartupType Manual -ErrorAction Stop; Write-Ok "Service '$n' was disabled and has been set to 'Manual'."; Add-Action 'Update services' 'Fixed' "$n from Disabled to Manual." } catch {}
+            try { Set-ServiceStartTracked -Name $n -StartupType Manual; Write-Ok "Service '$n' was disabled and has been set to 'Manual'."; Add-Action 'Update services' 'Fixed' "$n from Disabled to Manual." } catch {}
         }
     }
     $wuPol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
@@ -2613,6 +3264,15 @@ function Invoke-WindowsUpdateModule {
             -Evidence (($preview | ForEach-Object { $_.Title }) -join "`n") -Recommendation 'Normally do not install; the contents arrive on the next regular Patch Tuesday.' -Status 'Info'
     }
 
+    # Report table: what is pending, with KB numbers and links
+    $pendRows = foreach ($grp in @(@{ K = 'Update'; L = $normal }, @{ K = 'Feature (Win 10)'; L = $feature }, @{ K = 'Preview (not installed)'; L = $preview })) {
+        foreach ($u in $grp.L) {
+            $kb = ''; try { $kb = ($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ', ' } catch {}
+            [pscustomobject]@{ Type = $grp.K; KB = $kb; Title = [string]$u.Title; Size = (Format-Size $u.MaxDownloadSize) }
+        }
+    }
+    if (@($pendRows).Count -gt 0) { $script:Tables['Pending Windows updates'] = @($pendRows) }
+
     $toInstall = New-Object System.Collections.ArrayList
     if (-not (Test-LongOperationAllowed 'Windows Update installation' -MinFreeGB 5)) {
         if (($normal.Count + $feature.Count) -gt 0) {
@@ -2709,6 +3369,10 @@ function Invoke-StoreModule {
     # 1. winget (supported, silent, with progress output)
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
+        # Packages the user wants to keep at their current version (config: WingetPin = [ids])
+        foreach ($pin in @($script:Config.WingetPin)) {
+            if ($pin -and -not $script:DryRun) { Invoke-Native -File $winget.Source -Arguments @('pin', 'add', '--id', [string]$pin, '--accept-source-agreements') -Quiet -TimeoutSec 60 | Out-Null }
+        }
         if (Confirm-Step 'Update Microsoft Store apps via winget now?') {
             Write-Info 'winget is updating the Store apps ... (may take a few minutes)'
             $r = Invoke-Native -File $winget.Source -Arguments @('upgrade', '--all', '--source', 'msstore', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') -Quiet
@@ -2765,6 +3429,81 @@ function Invoke-StoreModule {
 # ----------------------------------------------------------------------------------------------
 # 9. Optimizations
 # ----------------------------------------------------------------------------------------------
+function Invoke-StartupReview {
+    # Guided autostart review: shows each Run-key program with its measured boot delay and lets the user switch
+    # items off the same (reversible) way Task Manager does, via StartupApproved. Interactive only.
+    if ($script:Auto -or $script:DryRun) { return }
+    $sources = @(
+        @{ Hive = 'HKCU'; Run = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'; Appr = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' },
+        @{ Hive = 'HKLM'; Run = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'; Appr = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' },
+        @{ Hive = 'HKLM32'; Run = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Appr = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32' })
+    $delays = @{}
+    if ($script:Tables.Contains('Slowest startup programs (last 30 days)')) {
+        foreach ($r in @($script:Tables['Slowest startup programs (last 30 days)'])) { $delays[[string]$r.'Startup program'] = $r.'Average delay (s)' }
+    }
+    $items = @()
+    foreach ($s in $sources) {
+        $p = Get-ItemProperty -LiteralPath $s.Run -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        foreach ($prop in $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' }) {
+            $state = Get-ItemProperty -LiteralPath $s.Appr -Name $prop.Name -ErrorAction SilentlyContinue
+            $disabled = $false
+            if ($state) { $b = $state.($prop.Name); if ($b -and ($b[0] % 2) -eq 1) { $disabled = $true } }
+            if ($disabled) { continue }
+            $delay = ($delays.GetEnumerator() | Where-Object { $_.Key -like "*$($prop.Name)*" -or ([string]$prop.Value) -like "*$($_.Key)*" } | Select-Object -First 1).Value
+            $items += [pscustomobject]@{ No = $items.Count + 1; Name = $prop.Name; Where = $s.Hive; Command = ([string]$prop.Value); Appr = $s.Appr; Delay = $delay }
+        }
+    }
+    if ($items.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host '  Programs that start with Windows (enabled):' -ForegroundColor Cyan
+    foreach ($i in $items) {
+        $cmd = if ($i.Command.Length -gt 60) { $i.Command.Substring(0, 60) + '...' } else { $i.Command }
+        Write-Host ("   {0,2}. {1,-28} {2,-6} {3}{4}" -f $i.No, $i.Name, $i.Where, $cmd, $(if ($i.Delay) { "   [boot delay ~$($i.Delay) s]" } else { '' }))
+    }
+    $ans = Read-Host '  ?  Numbers to switch OFF (comma separated, Enter = leave all, reversible with -Undo)'
+    if ([string]::IsNullOrWhiteSpace($ans)) { return }
+    foreach ($n in ($ans -split '[,; ]+' | Where-Object { $_ -match '^\d+$' })) {
+        $it = $items | Where-Object { $_.No -eq [int]$n } | Select-Object -First 1
+        if (-not $it) { continue }
+        try {
+            if (-not (Test-Path -LiteralPath $it.Appr)) { New-Item -Path $it.Appr -Force | Out-Null }
+            $old = $null; try { $old = (Get-ItemProperty -LiteralPath $it.Appr -Name $it.Name -ErrorAction Stop).($it.Name) } catch {}
+            $bytes = [byte[]](3, 0, 0, 0) + [BitConverter]::GetBytes([DateTime]::UtcNow.ToFileTimeUtc())
+            Set-ItemProperty -LiteralPath $it.Appr -Name $it.Name -Value $bytes -Type Binary -Force -ErrorAction Stop
+            Add-JournalEntry -Type 'StartupApproved' -Target "$($it.Appr)|$($it.Name)" -Old $(if ($old) { [BitConverter]::ToString($old) } else { $null }) -New 'disabled'
+            Write-Ok "Switched off: $($it.Name)"
+            Add-Action 'Startup review' 'Success' "Disabled autostart: $($it.Name)"
+        } catch { Write-Warn2 "Could not switch off $($it.Name): $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-DriverStoreReview {
+    # Old versions of the same driver pile up in the driver store. Report; optionally keep newest two per driver.
+    try {
+        $drv = @(Get-WindowsDriver -Online -ErrorAction Stop)
+    } catch { return }
+    $groups = @($drv | Group-Object { "$($_.OriginalFileName | Split-Path -Leaf)|$($_.ProviderName)|$($_.ClassName)" } | Where-Object { $_.Count -gt 2 })
+    if ($groups.Count -eq 0) { return }
+    $stale = foreach ($g in $groups) { $g.Group | Sort-Object { [version]($_.Version -replace '[^\d\.]', '') } -Descending -ErrorAction SilentlyContinue | Select-Object -Skip 2 }
+    $stale = @($stale)
+    if ($stale.Count -eq 0) { return }
+    Add-Finding -Id 'driverstore-old' -Severity 'Info' -Category 'Storage' -Title "$($stale.Count) old driver package version(s) in the driver store" `
+        -Meaning 'Windows keeps previous driver versions for rollback. More than two per driver is rarely useful and wastes space.' `
+        -Evidence (($stale | Select-Object -First 8 | ForEach-Object { "$($_.Driver) $($_.ProviderName) $($_.Version)" }) -join "`n") `
+        -Recommendation 'The Cleanup module offers to remove all but the newest two versions of each driver (never drivers in use).' -Status 'Info'
+    if (Confirm-Step "Remove these $($stale.Count) old driver package(s)? (Keeps the two newest of each; packages in use are refused by Windows.)" -Default $false -Risky) {
+        $n = 0
+        foreach ($d in $stale) {
+            $r = Invoke-Native -File "$env:WINDIR\System32\pnputil.exe" -Arguments @('/delete-driver', $d.Driver) -Quiet -TimeoutSec 60
+            if ($r.ExitCode -eq 0) { $n++ }
+        }
+        Write-Ok "$n old driver package(s) removed."
+        Add-Action 'Driver store' 'Success' "$n of $($stale.Count) old packages removed."
+        Set-FindingFixed -Id 'driverstore-old' -WhatWasDone "$n old driver package(s) were removed (newest two versions kept)."
+    }
+}
+
 function Invoke-Optimizations {
     Initialize-RestorePoint
 
@@ -2835,7 +3574,7 @@ function Invoke-Optimizations {
                 -Meaning 'A fixed page file that is set too small can lead to memory errors and crashes; otherwise Windows can adjust the size optimally by itself.' `
                 -Recommendation 'Enable automatic management (System Properties > Advanced > Performance > Settings > Advanced > Virtual memory).'
             if (Confirm-Step 'Turn on automatic management of the page file (recommended, restart required)?') {
-                try { Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true } -ErrorAction Stop; Set-FindingFixed -Id 'pagefile-manual' -WhatWasDone 'Automatic management of the page file was turned on (effective after a restart).'; Request-Reboot 'Page file' } catch { Write-Warn2 $_.Exception.Message }
+                try { Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true } -ErrorAction Stop; Add-JournalEntry -Type 'Pagefile' -Target 'AutomaticManagedPagefile' -Old 'False' -New 'True'; Set-FindingFixed -Id 'pagefile-manual' -WhatWasDone 'Automatic management of the page file was turned on (effective after a restart).'; Request-Reboot 'Page file' } catch { Write-Warn2 $_.Exception.Message }
             }
         }
     } catch {}
@@ -2856,6 +3595,8 @@ function Invoke-Optimizations {
                 -Meaning 'Power saver limits the CPU speed. On a desktop this just makes the PC slower without saving noticeable energy.' `
                 -Recommendation "Control Panel > Power Options > choose 'Balanced'."
             if (Confirm-Step 'Switch to the Balanced power plan now?') {
+                $oldGuid = [regex]::Match($plan, '[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}').Value
+                if ($oldGuid) { Add-JournalEntry -Type 'PowerPlan' -Target 'ActiveScheme' -Old $oldGuid -New '381b4222-f694-41f0-9685-ff5bb260df2e' }
                 Invoke-Native -File "$env:WINDIR\System32\powercfg.exe" -Arguments @('/setactive', '381b4222-f694-41f0-9685-ff5bb260df2e') -Quiet | Out-Null
                 Set-FindingFixed -Id 'powerplan-saver' -WhatWasDone 'Switched to the Balanced power plan.'
             }
@@ -2878,6 +3619,7 @@ function Invoke-Optimizations {
                 -Recommendation 'Task Manager (Ctrl+Shift+Esc) > "Startup" tab: set programs with "High impact" that you do not need all the time to "Disabled". The script deliberately does not do this itself, because only you know what you need. The list is in the appendix of the report.' -Status 'Open'
         }
     } catch {}
+    if ($script:Facts.Contains('Startup entries') -and [int]$script:Facts['Startup entries'] -gt 8 -and (Confirm-Step 'Review the autostart programs now and switch off the ones you do not need?' -Default $false)) { Invoke-StartupReview }
     Add-Action 'Optimizations' 'Completed' 'Checked TRIM/defrag, Defender, time, DNS, page file, startup.'
 }
 
@@ -2922,6 +3664,10 @@ function New-MarkdownReport {
     $L.Add("> Created on $(Get-Date -Format 'yyyy-MM-dd') at $(Get-Date -Format 'HH:mm') · Duration $dur min. · Computer **$env:COMPUTERNAME** · Script version $script:Version"); $L.Add('')
     $L.Add('## 1. Overall result'); $L.Add('')
     $L.Add($verdict); $L.Add('')
+    $hs = Get-HealthScore
+    $L.Add("**Health score: $($hs.Score) / 100 ($($hs.Label))** `` $('█' * [math]::Round($hs.Score / 5))$('░' * (20 - [math]::Round($hs.Score / 5))) ``"); $L.Add('')
+    if ($script:Suppressed.Count -gt 0) { $L.Add("_$($script:Suppressed.Count) finding(s) are hidden by your configuration (SuppressFindings): $($script:Suppressed -join ', ')_"); $L.Add('') }
+    if ($script:Redact) { $L.Add('_This report was redacted (-Redact): computer name, user name, serial numbers, IP and MAC addresses are masked._'); $L.Add('') }
     $L.Add("| Fixed automatically | Open (your task) | Notes |"); $L.Add('|---|---|---|')
     $L.Add("| **$($fixed.Count)** | **$($open.Count)** | **$($info.Count)** |"); $L.Add('')
     if ($script:FreedTotal -gt 0) { $L.Add("🧹 The cleanup freed approx. **$(Format-Size $script:FreedTotal)** of storage."); $L.Add('') }
@@ -2956,6 +3702,7 @@ function New-MarkdownReport {
         $L.Add("**What does this mean?** $($f.Meaning)"); $L.Add('')
         if ($f.Evidence) { $L.Add('**How was it detected?**'); $L.Add(''); foreach ($e in ($f.Evidence -split "`r?`n")) { $L.Add("> $e") }; $L.Add('') }
         if ($f.Recommendation) { $L.Add("**What can you do?** $($f.Recommendation)"); $L.Add('') }
+        $L.Add("_Finding ID:_ ``$($f.Id)`` · [background and fix guide]($($script:RepoUrl)/blob/main/docs/FINDINGS.md#$(($f.Id.ToLower() -replace '[^a-z0-9]+', '-').Trim('-')))"); $L.Add('')
     }
 
     $L.Add('## 3. Fixed automatically'); $L.Add('')
@@ -3007,6 +3754,7 @@ function New-MarkdownReport {
 function Write-ReportFile {
     param([string]$Path, [string]$Content)
     $enc = New-Object System.Text.UTF8Encoding($true)
+    $Content = Protect-ReportText $Content
     try {
         [IO.File]::WriteAllText($Path, $Content, $enc)
         return $Path
@@ -3041,6 +3789,7 @@ function Save-Snapshot {
     try {
         $snap = [ordered]@{
             Version = $script:Version; Date = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME; DryRun = $script:DryRun
+            Score = (Get-HealthScore).Score
             Facts = $script:Facts
             Findings = @($script:Findings.ToArray() | ForEach-Object { [ordered]@{ Id = $_.Id; Severity = $_.Severity; Category = $_.Category; Title = $_.Title; Status = $_.Status } })
         }
@@ -3063,18 +3812,30 @@ function New-HtmlReport {
     $h.Add('<style>:root{color-scheme:light dark}body{font:15px/1.5 Segoe UI,Arial,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem}h1{margin-bottom:0}.sub{color:#6c757d}')
     $h.Add('.card{border:1px solid #8884;border-left:6px solid var(--c);border-radius:6px;padding:.7rem 1rem;margin:.8rem 0}.tag{display:inline-block;color:#fff;background:var(--c);border-radius:4px;padding:0 .5rem;font-size:.8rem}')
     $h.Add('table{border-collapse:collapse;width:100%;margin:.5rem 0}td,th{border:1px solid #8884;padding:.25rem .5rem;text-align:left;font-size:.9rem;vertical-align:top}pre{white-space:pre-wrap;background:#8881;padding:.5rem;border-radius:4px}')
-    $h.Add('.kpi span{display:inline-block;margin-right:1.5rem;font-size:1.1rem}</style></head><body>')
+    $h.Add('.kpi span{display:inline-block;margin-right:1.5rem;font-size:1.1rem}#flt button{font:inherit;padding:.15rem .7rem;border:1px solid #8888;border-radius:4px;background:transparent;color:inherit;cursor:pointer}:focus-visible{outline:3px solid #1c7ed6;outline-offset:2px}@media print{#flt{display:none}.card{break-inside:avoid}}</style></head><body><main>')
     $h.Add("<h1>Windows 10 System Report</h1><div class='sub'>$(& $e $env:COMPUTERNAME) &middot; $(Get-Date -Format 'yyyy-MM-dd HH:mm') &middot; script $(& $e $script:Version)$(if ($script:DryRun) { ' &middot; DRY RUN' })</div>")
-    $h.Add("<p class='kpi'><span><b>$($fixed.Count)</b> fixed</span><span><b>$($open.Count)</b> open</span><span><b>$($info.Count)</b> notes</span>$(if ($script:FreedTotal -gt 0) { "<span><b>$(& $e (Format-Size $script:FreedTotal))</b> freed</span>" })</p>")
+    $hs = Get-HealthScore
+    $h.Add("<p class='kpi'><span><b>$($hs.Score)</b>/100 health ($(& $e $hs.Label))</span><span><b>$($fixed.Count)</b> fixed</span><span><b>$($open.Count)</b> open</span><span><b>$($info.Count)</b> notes</span>$(if ($script:FreedTotal -gt 0) { "<span><b>$(& $e (Format-Size $script:FreedTotal))</b> freed</span>" })</p>")
     if ($script:RebootNeeded) { $h.Add("<p><b>Restart required:</b> $(& $e ($script:RebootReasons -join '; '))</p>") }
     $h.Add("<p><b>Windows 11 protection:</b> $(& $e $script:Win11BlockState)</p>")
     if ($script:Diff -and $script:Diff.HasPrev) {
         $h.Add("<p>Since the previous run ($(& $e $script:Diff.PrevDate)): <b>$(@($script:Diff.New).Count)</b> new, <b>$(@($script:Diff.Resolved).Count)</b> resolved.</p>")
     }
-    $h.Add('<h2>Open problems</h2>')
+    # Score trend from earlier snapshots (inline SVG)
+    try {
+        $pts = @(Get-ChildItem -LiteralPath $script:SnapshotDir -Filter 'snapshot_*.json' -ErrorAction Stop | Sort-Object LastWriteTime | Select-Object -Last 30 |
+            ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).Score } | Where-Object { $null -ne $_ })
+        $pts += $hs.Score
+        if ($pts.Count -ge 2) {
+            $w = 300; $ht = 60; $step = $w / ($pts.Count - 1)
+            $poly = (0..($pts.Count - 1) | ForEach-Object { '{0:N1},{1:N1}' -f ($_ * $step), ($ht - ($pts[$_] / 100 * $ht)) }) -join ' '
+            $h.Add("<p class='sub'>Health score trend ($($pts.Count) runs)</p><svg width='$w' height='$ht' viewBox='0 0 $w $ht' role='img' aria-label='Health score trend'><polyline fill='none' stroke='#1c7ed6' stroke-width='2' points='$poly'/></svg>")
+        }
+    } catch {}
+    $h.Add('<h2>Open problems</h2><p id="flt"><button data-f="all">All</button> <button data-f="Critical">Critical</button> <button data-f="High">High</button> <button data-f="Medium">Medium</button> <button data-f="Low">Low</button></p>')
     if ($open.Count -eq 0) { $h.Add('<p>No open problems.</p>') }
     foreach ($f in $open) {
-        $h.Add("<div class='card' style='--c:$($sevColor[$f.Severity])'><span class='tag'>$(& $e $f.Severity)</span> <b>$(& $e $f.Title)</b> <span class='sub'>$(& $e $f.Category)</span>")
+        $h.Add("<div class='card' data-sev='$($f.Severity)' style='--c:$($sevColor[$f.Severity])'><span class='tag'>$(& $e $f.Severity)</span> <b>$(& $e $f.Title)</b> <span class='sub'>$(& $e $f.Category)</span>")
         $h.Add("<p><b>What does this mean?</b> $(& $e $f.Meaning)</p>")
         if ($f.Evidence) { $h.Add("<p><b>How was it detected?</b></p><pre>$(& $e $f.Evidence)</pre>") }
         if ($f.Recommendation) { $h.Add("<p><b>What can you do?</b> $(& $e $f.Recommendation)</p>") }
@@ -3096,7 +3857,7 @@ function New-HtmlReport {
     }
     $h.Add('<h2>Action log</h2><table><tr><th>Time</th><th>Module</th><th>Result</th><th>Details</th></tr>')
     foreach ($a in $script:Actions) { $h.Add("<tr><td>$(& $e $a.Time)</td><td>$(& $e $a.Module)</td><td>$(& $e $a.Status)</td><td>$(& $e $a.Details)</td></tr>") }
-    $h.Add("</table><p class='sub'>Console log: $(& $e $script:LogPath)</p></body></html>")
+    $h.Add("</table><p class='sub'>Console log: $(& $e $script:LogPath)</p><script>document.querySelectorAll('#flt button').forEach(function(b){b.onclick=function(){var f=b.dataset.f;document.querySelectorAll('.card').forEach(function(c){c.style.display=(f==='all'||c.dataset.sev===f)?'':'none'})}})</script></main></body></html>")
     return ($h -join "`n")
 }
 
@@ -3137,6 +3898,7 @@ function Invoke-Run {
             'disk'  { Invoke-Module 'Disk health' { Invoke-DiskDiagnostics } }
             'sec'   { Invoke-Module 'Security check' { Invoke-SecurityDiagnostics } }
             'audit' { Invoke-Module 'Security audit' { Invoke-SecurityAudit } }
+            'rec'   { Invoke-Module 'Recovery readiness' { Invoke-RecoveryCheck } }
             'evt'   { Invoke-Module 'Event log analysis' { Invoke-EventLogAnalysis } }
             'svc'   { Invoke-Module 'Services and drivers' { Invoke-ServiceAndDriverCheck } }
             'clean' { Invoke-Module 'Cleanup' { Invoke-Cleanup } }
@@ -3149,8 +3911,8 @@ function Invoke-Run {
     }
 }
 
-$script:ModulesDiag = @('sys', 'net', 'disk', 'sec', 'audit', 'evt', 'svc')
-$script:ModulesFull = @('sys', 'net', 'disk', 'sec', 'audit', 'evt', 'svc', 'clean', 'integ', 'wu', 'store', 'opt')
+$script:ModulesDiag = @('sys', 'net', 'disk', 'sec', 'audit', 'rec', 'evt', 'svc')
+$script:ModulesFull = @('sys', 'net', 'disk', 'sec', 'audit', 'rec', 'evt', 'svc', 'clean', 'integ', 'wu', 'store', 'opt')
 
 function Show-Menu {
     Clear-Host
@@ -3169,6 +3931,8 @@ function Show-Menu {
     Write-Host '   7  Optimizations only'
     Write-Host '   8  Set/check the Windows 11 block'
     Write-Host '   9  Security deep-dive only (persistence, accounts, ports, Defender settings)'
+    Write-Host '   R  Recovery readiness (WinRE, restore points, backups, BitLocker keys)'
+    Write-Host '   U  Undo the changes of the last run     H  Health history     C  Config file'
     Write-Host '   0  Exit (the report is still created)'
     Write-Host ''
     return (Read-Host '  Your choice')
@@ -3176,14 +3940,73 @@ function Show-Menu {
 
 function Wait-Key { if (-not $script:Auto) { Read-Host '  Press Enter to return to the menu' | Out-Null } }
 
+function Show-Gui {
+    # Minimal launcher: choose modules/options, then start this same script with the matching parameters.
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $mods = [ordered]@{
+        'sys' = 'System diagnostics'; 'net' = 'Network'; 'disk' = 'Disk health'; 'sec' = 'Security check'; 'audit' = 'Security audit (persistence, accounts, ports)'
+        'rec' = 'Recovery readiness'; 'evt' = 'Event log analysis'; 'svc' = 'Services and drivers'; 'clean' = 'Cleanup'; 'integ' = 'Integrity and repair (DISM, SFC)'
+        'wu' = 'Windows Update (Windows 11 stays blocked)'; 'store' = 'Store / app updates'; 'opt' = 'Optimizations'
+    }
+    $form = New-Object Windows.Forms.Form
+    $form.Text = 'Windows 10 System Maintenance'; $form.Size = New-Object Drawing.Size(460, 560); $form.StartPosition = 'CenterScreen'; $form.FormBorderStyle = 'FixedDialog'; $form.MaximizeBox = $false
+    $lbl = New-Object Windows.Forms.Label; $lbl.Text = 'Choose what to run:'; $lbl.Location = '12,10'; $lbl.AutoSize = $true; $form.Controls.Add($lbl)
+    $list = New-Object Windows.Forms.CheckedListBox; $list.Location = '12,34'; $list.Size = '420,300'; $list.CheckOnClick = $true
+    $diagOnly = 'sys', 'net', 'disk', 'sec', 'audit', 'rec', 'evt', 'svc'
+    foreach ($k in $mods.Keys) { [void]$list.Items.Add("$k  -  $($mods[$k])", ($k -in $diagOnly)) }
+    $form.Controls.Add($list)
+    $dry = New-Object Windows.Forms.CheckBox; $dry.Text = 'Dry run (change nothing)'; $dry.Location = '12,345'; $dry.AutoSize = $true; $dry.Checked = $true; $form.Controls.Add($dry)
+    $auto = New-Object Windows.Forms.CheckBox; $auto.Text = 'Unattended (no questions; risky steps are skipped)'; $auto.Location = '12,370'; $auto.AutoSize = $true; $form.Controls.Add($auto)
+    $html = New-Object Windows.Forms.CheckBox; $html.Text = 'Also create an HTML report'; $html.Location = '12,395'; $html.AutoSize = $true; $html.Checked = $true; $form.Controls.Add($html)
+    $red = New-Object Windows.Forms.CheckBox; $red.Text = 'Redact the report (safe to share)'; $red.Location = '12,420'; $red.AutoSize = $true; $form.Controls.Add($red)
+    $go = New-Object Windows.Forms.Button; $go.Text = 'Run'; $go.Location = '12,455'; $go.Size = '120,32'; $go.DialogResult = 'OK'; $form.Controls.Add($go); $form.AcceptButton = $go
+    $cancel = New-Object Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.Location = '142,455'; $cancel.Size = '100,32'; $cancel.DialogResult = 'Cancel'; $form.Controls.Add($cancel)
+    if ($form.ShowDialog() -ne 'OK') { return }
+    $sel = @(); $i = 0
+    foreach ($k in $mods.Keys) { if ($list.GetItemChecked($i)) { $sel += $k }; $i++ }
+    if ($sel.Count -eq 0) { return }
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PSCommandPath`"", '-NoElevate', '-Modules', "`"$($sel -join ',')`"")
+    if ($dry.Checked) { $argList += '-DryRun' }
+    if ($auto.Checked) { $argList += '-Auto' }
+    if ($red.Checked) { $argList += '-Redact' }
+    $argList += '-ReportFormat'; $argList += $(if ($html.Checked) { '"Markdown,Html"' } else { 'Markdown' })
+    # Release the single-instance lock so the child run can take it
+    try { if ($script:HasMutex) { $script:Mutex.ReleaseMutex(); $script:HasMutex = $false } } catch {}
+    $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Start-Process -FilePath $psExe -ArgumentList $argList
+}
+
 # ---- Start ----
-Clear-Host
+function Stop-Script([int]$Code = 0) {
+    # Releases the keep-awake request, the single-instance lock and the transcript, then exits.
+    try { [void][Win32.PowerState]::SetThreadExecutionState([uint32]2147483648) } catch {}
+    if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch {} }
+    try { if ($script:HasMutex) { $script:Mutex.ReleaseMutex() } } catch {}
+    exit $Code
+}
+
+if (-not $script:Quiet) { Clear-Host }
 Write-Title "Windows 10 System Maintenance $script:Version"
 Write-Info "The report is saved to: $script:ReportDir"
 Write-Info "Console log: $script:LogPath"
 if ($script:Auto) { Write-Warn2 'Automatic mode: no prompts are shown. Riskier actions are skipped.' }
 if ($script:DryRun) { Write-Warn2 'DRY RUN: diagnosing only. Nothing will be deleted, repaired, installed or changed.' }
+Import-ScriptConfig
+if (-not (Test-Path -LiteralPath $script:ConfigFile) -and -not $script:Auto) { New-ScriptConfig }
+
+# Utility commands that replace the normal run
+if ($Gui) { Show-Gui; Stop-Script 0 }
+if ($History) { Show-History; Stop-Script 0 }
+if ($Undo) { Invoke-Undo; Stop-Script 0 }
+if ($UninstallKB) { Invoke-KbUninstall $UninstallKB; Stop-Script 0 }
+
 Initialize-Preflight
+
+$utilityOnly = ($CheckUpdate -or $ExportApps) -and $script:ModuleList.Count -eq 0 -and -not $script:Auto
+if ($CheckUpdate) { Invoke-UpdateCheck }
+if ($ExportApps) { Export-InstalledApp }
+if ($utilityOnly) { Stop-Script 0 }
 
 if ($script:ModuleList.Count -gt 0) {
     Invoke-Run $script:ModuleList
@@ -3193,9 +4016,19 @@ if ($script:ModuleList.Count -gt 0) {
     $quit = $false
     do {
         $c = Show-Menu
-        switch ($c.Trim()) {
+        switch ($c.Trim().ToLower()) {
             '1' { Invoke-Run $script:ModulesFull; Wait-Key }
-            '2' { Invoke-Run $script:ModulesDiag; Wait-Key }
+            '2' {
+                Invoke-Run $script:ModulesDiag
+                $openNow = @($script:Findings | Where-Object { $_.Status -eq 'Open' }).Count
+                if ($openNow -gt 0 -and -not $script:DryRun) {
+                    Write-Host ''
+                    if (Confirm-Step "$openNow open finding(s). Run the repair and maintenance modules now (cleanup, integrity, updates, Store, optimizations)? Each risky step still asks first.") {
+                        Invoke-Run @('clean', 'integ', 'wu', 'store', 'opt')
+                    }
+                }
+                Wait-Key
+            }
             '3' { Invoke-Run @('clean'); Wait-Key }
             '4' { Invoke-Run @('integ'); Wait-Key }
             '5' { Invoke-Run @('wu'); Wait-Key }
@@ -3203,6 +4036,10 @@ if ($script:ModuleList.Count -gt 0) {
             '7' { Invoke-Run @('opt'); Wait-Key }
             '8' { Invoke-Run @('w11'); Wait-Key }
             '9' { Invoke-Run @('audit'); Wait-Key }
+            'r' { Invoke-Run @('rec'); Wait-Key }
+            'u' { Invoke-Undo; Wait-Key }
+            'h' { Show-History; Wait-Key }
+            'c' { New-ScriptConfig; Write-Info "Edit this file to suppress findings or protect folders: $script:ConfigFile"; Wait-Key }
             '0' { $quit = $true }
             default { Write-Warn2 'Invalid selection.'; Start-Sleep -Seconds 1 }
         }
@@ -3225,7 +4062,10 @@ $counts = @{
     fixed = @($script:Findings | Where-Object { $_.Status -eq 'Fixed' }).Count
 }
 Write-Host ''
-Write-Host "  Fixed automatically: $($counts.fixed)   |   Open: $($counts.open)" -ForegroundColor Cyan
+$finalScore = Get-HealthScore
+Out-Line "  Health score: $($finalScore.Score)/100 ($($finalScore.Label))   |   Fixed automatically: $($counts.fixed)   |   Open: $($counts.open)" 'Cyan'
+if ($script:Journal.Count -gt 0) { Write-Info "$($script:Journal.Count) change(s) were recorded and can be reverted with -Undo (menu U)." }
+if ($WebhookUrl -or $script:Config.WebhookUrl -or $Toast) { Send-RunNotification }
 
 # Exit code for schedulers/RMM: 0 = nothing important open, 10 = Medium, 11 = High, 12 = Critical
 $worstOpen = 99
@@ -3243,7 +4083,4 @@ if ($script:RebootNeeded -and -not $script:Auto) {
 }
 if (-not $script:Auto) { Read-Host '  Press Enter to exit' | Out-Null }
 
-# Release the keep-awake request and the single-instance lock
-try { [void][Win32.PowerState]::SetThreadExecutionState([uint32]2147483648) } catch {}
-try { if ($script:HasMutex) { $script:Mutex.ReleaseMutex() } } catch {}
-exit $script:ExitCode
+Stop-Script $script:ExitCode

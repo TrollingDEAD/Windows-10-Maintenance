@@ -44,7 +44,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\Windows10_SystemMaintenance.ps1
 
 ```text
  ======================================================================
-  WINDOWS 10 - SYSTEM MAINTENANCE  (Version 3.0)
+  WINDOWS 10 - SYSTEM MAINTENANCE  (Version 3.1)
  ======================================================================
 
   1  Full maintenance (recommended): diagnostics, cleanup, repair, updates, Store, optimization
@@ -56,6 +56,8 @@ powershell.exe -ExecutionPolicy Bypass -File .\Windows10_SystemMaintenance.ps1
   7  Optimizations only
   8  Set/check the Windows 11 block
   9  Security deep-dive only (persistence, accounts, ports, Defender settings)
+  R  Recovery readiness (WinRE, restore points, backups, BitLocker keys)
+  U  Undo the changes of the last run   H  Health history   C  Config file
   0  Exit (the report is still created)
 ```
 
@@ -77,7 +79,17 @@ powershell.exe -ExecutionPolicy Bypass -File .\Windows10_SystemMaintenance.ps1
 | `-ReportFormat Markdown,Html,Json` | Report formats to write. A JSON snapshot is always kept for the "new since last run" comparison. |
 | `-LogRetentionDays <n>` | Delete logs and snapshots older than `n` days (default 60, `0` keeps everything). |
 | `-AllowOnBattery` | Long operations (DISM, SFC, updates, defrag) are skipped on battery power unless you pass this. |
-| `-Schedule` / `-Unschedule` | Register or remove a weekly task (Sundays 03:00, SYSTEM, `-Auto`). |
+| `-Schedule` / `-Unschedule` | Register or remove a weekly task (default Sunday 03:00, SYSTEM, `-Auto`, only when the PC is idle). Change the slot with `-ScheduleDay` and `-ScheduleTime`. |
+| `-Undo` | Revert the registry, service, policy, power-plan, feature and autostart changes recorded by the last run. |
+| `-History` | Print the health-score trend of all stored runs. |
+| `-Redact` | Mask computer and user names, serial numbers, IP and MAC addresses in the reports, so they can be shared. |
+| `-Quiet` | Plain output without colours, for log files and RMM tools. |
+| `-ConfigPath <file>` | Use a specific `config.json` (suppress findings, protect folders and services, pin winget packages, webhook). |
+| `-WebhookUrl <https-url>` / `-Toast` | Send a short summary to Teams, Slack, Discord or ntfy (only when findings changed) / show a Windows notification. |
+| `-CheckUpdate` | Ask GitHub whether a newer release exists; downloads only after a yes and verifies the SHA256. Never updates itself. |
+| `-UninstallKB KB5034441` | Uninstall one Windows update by KB number (asks first). |
+| `-ExportApps` | Export the installed winget packages to a JSON file for a later `winget import`. |
+| `-Gui` | A small window to pick modules and options (dry run, HTML report, redaction). |
 
 ```powershell
 # Unattended full run, for example from Task Scheduler
@@ -91,6 +103,31 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Windows10_SystemMainte
 ```
 
 **Exit codes** (useful for schedulers and RMM tools): `0` nothing important open, `10` Medium finding open, `11` High, `12` Critical, `3` no administrator rights, `4` another instance is already running.
+
+### Configuration
+
+The first interactive run writes `%LOCALAPPDATA%\Windows10_SystemMaintenance\config.json` (menu **C**):
+
+```json
+{
+  "SuppressFindings": ["bios-old", "evt-*"],
+  "NeverCleanPaths": ["C:\\Users\\me\\AppData\\Local\\Temp\\keep"],
+  "NeverTouchServices": ["Spooler"],
+  "WingetPin": ["Mozilla.Firefox"],
+  "EsuEndDate": "2026-10-13",
+  "WebhookUrl": ""
+}
+```
+
+Suppressed findings are counted and listed as hidden in the report, never silently dropped. Every finding ID is explained in [docs/FINDINGS.md](docs/FINDINGS.md).
+
+### Several PCs
+
+[`Invoke-FleetMaintenance.ps1`](Invoke-FleetMaintenance.ps1) runs the script unattended on a list of computers over PowerShell remoting and collects the JSON reports into one summary table and CSV (see the [report schema](schema/report.schema.json)).
+
+```powershell
+.\Invoke-FleetMaintenance.ps1 -ComputerName PC01,PC02 -DryRun
+```
 
 ## What it does
 
@@ -107,6 +144,8 @@ Read-only checks that feed the report.
 - **Security audit:** local accounts, listening ports, scheduled tasks and Run keys (with signature check), services with unquoted or user-writable paths, WMI event subscriptions, Winlogon/IFEO/AppInit hijacks, installed software and end-of-life detection
 - **Network:** connectivity, DNS, metered connection, link speed and packet errors, Wi-Fi signal, router latency and packet loss, time source
 - **Event log:** repeated crashes and hangs, stop (bugcheck) codes, storage-controller resets, Defender detections, Reliability Monitor index, memory-diagnostic result
+- **Recovery readiness:** Windows Recovery Environment, restore-point age, File History / OneDrive backup, BitLocker recovery keys, boot configuration
+- **Performance:** boot time and the slowest startup programs, busiest processes (5 s sample), disk activity, slow shutdowns, disabled or cleared event logs
 - **Services and drivers:** failed or disabled services, devices with driver errors, unsigned and very old drivers
 
 </td>
@@ -191,6 +230,16 @@ An example of how a finding reads:
 | Console transcript | `%LOCALAPPDATA%\Windows10_SystemMaintenance\Logs\` |
 | Run snapshots | `%LOCALAPPDATA%\Windows10_SystemMaintenance\Snapshots\` |
 
+## Documentation
+
+| Page | Content |
+| --- | --- |
+| [docs/SAFETY.md](docs/SAFETY.md) | Everything the script can change or contact: registry values, services, deleted folders, commands, network destinations |
+| [docs/FINDINGS.md](docs/FINDINGS.md) | One section per finding ID: what it means, what to do, how to suppress it |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Log locations, exit codes, common problems, how to file a good bug report |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Source layout, run flow, how to add a check or an event rule |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Ideas that are not implemented yet |
+
 ## Requirements
 
 | | |
@@ -242,9 +291,13 @@ The update module keeps working for as long as Microsoft delivers updates (inclu
 ## Development
 
 ```powershell
+# Edit src/*.ps1, then regenerate the single-file script and the findings reference
+.\tools\Build-Script.ps1
+.\tools\New-FindingDocs.ps1
+
 # Lint
 Install-Module PSScriptAnalyzer -Scope CurrentUser
-Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+Invoke-ScriptAnalyzer -Path .\Windows10_SystemMaintenance.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
 
 # Tests
 Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser
@@ -253,8 +306,13 @@ Invoke-Pester .\tests
 
 ```text
 .
-├── Windows10_SystemMaintenance.ps1   # the tool
-├── tests/                            # Pester tests
+├── Windows10_SystemMaintenance.ps1   # the tool (generated from src/ - edit src/, then run tools/Build-Script.ps1)
+├── src/                              # development sources, one file per area
+├── tools/                            # Build-Script.ps1, New-FindingDocs.ps1
+├── Invoke-FleetMaintenance.ps1       # run on many PCs via PowerShell remoting
+├── docs/                             # FINDINGS, SAFETY, ARCHITECTURE, TROUBLESHOOTING, ROADMAP
+├── schema/                           # JSON schema of the report
+├── tests/                            # Pester tests (unit + dry-run smoke test)
 ├── PSScriptAnalyzerSettings.psd1     # lint configuration
 ├── .github/                          # CI, issue and PR templates, Dependabot
 ├── CHANGELOG.md  CONTRIBUTING.md  SECURITY.md  CODE_OF_CONDUCT.md  LICENSE

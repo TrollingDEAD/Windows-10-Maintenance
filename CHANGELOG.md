@@ -3,6 +3,32 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [3.1] - 2026-10-10
+
+### Added
+- **Undo journal and `-Undo`** (menu U): registry values, service start types, power plan, firewall, SMB1, optional features, Guest account, page file and autostart changes are recorded with their previous value and can be reverted.
+- **`-Redact`** masks computer and user names, serial numbers, IP and MAC addresses in all reports.
+- **Configuration file** (`config.json`, menu C): `SuppressFindings` (wildcards), `NeverCleanPaths`, `NeverTouchServices`, `WingetPin`, `EsuEndDate`, `WebhookUrl`. Suppressed findings are listed as hidden in the report.
+- **Health score** (0-100) in the console, Markdown and HTML reports; **`-History`** and an inline trend chart in the HTML report; HTML report with severity filter, print layout and keyboard focus styles.
+- **Recovery readiness module** (menu R): Windows RE (can enable it), restore-point age, File History / OneDrive backup, BitLocker recovery keys, BCD readability.
+- **Performance diagnostics:** boot time and slowest startup programs, slow shutdowns, 5-second CPU/disk/process sample, disabled and cleared event logs, Office Click-to-Run status, servicing-channel hint (LTSC/IoT).
+- **Security audit additions:** open network shares, wide-open firewall rules, RDP without NLA, password/lockout policy, exploit protection (DEP), VPN and virtualization-based security state, expiring certificates, stale accounts, outdated browsers and browser extension inventory, orphaned scheduled tasks and services.
+- **Guided autostart review** (switch items off the same reversible way Task Manager does) and **driver store cleanup** (keep the two newest versions of each driver).
+- **Cleanup/repair extras:** optional DISM `/ResetBase`, print-queue repair, Windows Search index rebuild.
+- **Update extras:** pending-updates table with KB numbers, `-UninstallKB`, `-CheckUpdate` (SHA256-verified, never self-updating), winget pinning, `-ExportApps`.
+- **Notifications:** `-WebhookUrl` (https only, only when findings changed) and `-Toast`.
+- **`-Quiet`**, **`-Gui`** launcher, `-ScheduleDay` / `-ScheduleTime`; the scheduled task now runs only when the PC is idle and can wake it.
+- **`Invoke-FleetMaintenance.ps1`** to run the script on many PCs through PowerShell remoting and collect the JSON reports.
+- **Documentation:** `docs/` (FINDINGS generated from the code, SAFETY with the full blast radius, TROUBLESHOOTING, ARCHITECTURE, ROADMAP) and a JSON schema for the report. Reports link every open finding to its page.
+- **Development workflow:** the single-file script is now generated from `src/` by `tools/Build-Script.ps1`; `tools/New-FindingDocs.ps1` generates the findings reference; CI checks both, lints, runs unit tests and a dry-run smoke test; a tag-triggered workflow publishes a release with SHA256 checksums.
+
+### Fixed
+- Output of tools run with a time limit is decoded with the console (OEM) code page and includes standard error.
+- Windows 10 end-of-support date can be set in the config instead of being hard-coded.
+
+### Changed
+- The bug report template asks for the script version, display language and a redacted JSON report.
+
 ## [3.0] - 2026-10-10
 
 ### Fixed
